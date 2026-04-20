@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -94,13 +96,18 @@ class OrderLedger {
         if (record == nullptr || record->is_final() || fill_qty <= 0) {
             return;
         }
-        const int new_cum_qty = std::min(record->qty, record->cum_qty + fill_qty);
-        if (record->cum_qty == 0) {
+        const int old_cum_qty = record->cum_qty;
+        const int new_cum_qty = std::min(record->qty, old_cum_qty + fill_qty);
+        const int applied_qty = new_cum_qty - old_cum_qty;
+        if (applied_qty <= 0) {
+            return;
+        }
+        if (old_cum_qty == 0) {
             record->avg_fill_price = fill_price;
         } else {
-            const double prev_value = record->cum_qty * record->avg_fill_price;
-            const double fill_value = fill_qty * fill_price;
-            record->avg_fill_price = (prev_value + fill_value) / std::max(new_cum_qty, 1);
+            const double prev_value = old_cum_qty * record->avg_fill_price;
+            const double fill_value = applied_qty * fill_price;
+            record->avg_fill_price = (prev_value + fill_value) / new_cum_qty;
         }
         record->cum_qty = new_cum_qty;
         record->status = record->cum_qty >= record->qty ? OrderStatus::Filled : OrderStatus::PartiallyFilled;
