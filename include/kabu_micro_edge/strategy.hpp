@@ -4,6 +4,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -29,7 +30,7 @@ class MicroEdgeStrategy {
         config::StrategyConfig strategy,
         config::OrderProfile order_profile,
         bool dry_run = true,
-        TradeJournal* journal = nullptr,
+        std::shared_ptr<TradeJournal> journal = nullptr,
         EntryGuard entry_guard = {},
         int event_queue_maxsize = 512
     )
@@ -257,8 +258,7 @@ class MicroEdgeStrategy {
         if (now_ns - last_entry_order_action_ns_ < static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) { last_entry_block_reason_ = "entry_interval"; return; }
         if (++long_confirm_ < decision.required_confirm) { last_entry_block_reason_ = "confirming"; return; }
         long_confirm_ = 0;
-        const int pending_qty = execution_.has_working_entry() ? execution_.working_order->qty : 0;
-        int order_qty = std::min(config_.trade_volume, std::max(config_.max_long_inventory - execution_.inventory.qty - pending_qty, 0));
+        int order_qty = std::min(config_.trade_volume, std::max(config_.max_long_inventory - execution_.inventory.qty, 0));
         if (symbol_config_.max_notional > 0 && latest_board_->ask > 0) {
             order_qty = std::min(order_qty, static_cast<int>(symbol_config_.max_notional / latest_board_->ask));
         }
@@ -359,7 +359,9 @@ class MicroEdgeStrategy {
             if (bucket_it == entry_fill_counts_.end()) {
                 bucket_it = entry_fill_counts_.find("unknown");
             }
-            ++bucket_it->second;
+            if (bucket_it != entry_fill_counts_.end()) {
+                ++bucket_it->second;
+            }
         }
         if (working_entry_is_scale_in_ && current_qty > observed_inventory_qty_ && !working_entry_scale_in_counted_) {
             ++round_scale_in_count_;
@@ -432,7 +434,7 @@ class MicroEdgeStrategy {
     config::StrategyConfig config_;
     config::OrderProfile order_profile_;
     bool dry_run_{true};
-    TradeJournal* journal_{nullptr};
+    std::shared_ptr<TradeJournal> journal_{nullptr};
     EntryGuard entry_guard_;
     execution::ExecutionController execution_;
     signals::MicroEdgeSignalEngine signal_engine_;
