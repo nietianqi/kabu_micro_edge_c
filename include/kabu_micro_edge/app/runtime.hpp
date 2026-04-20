@@ -1,0 +1,389 @@
+#pragma once
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "kabu_micro_edge/config.hpp"
+#include "kabu_micro_edge/gateway.hpp"
+#include "kabu_micro_edge/risk.hpp"
+#include "kabu_micro_edge/strategy.hpp"
+
+namespace kabu::app {
+
+struct ReconcilePlan {
+    std::string mode;
+    double sleep_s{0.0};
+    bool poll_positions{true};
+    std::vector<std::string> order_ids;
+};
+
+inline void to_json(nlohmann::json& json, const ReconcilePlan& value) {
+    json = {
+        {"mode", value.mode},
+        {"sleep_s", value.sleep_s},
+        {"poll_positions", value.poll_positions},
+        {"order_ids", value.order_ids},
+    };
+}
+
+inline void from_json(const nlohmann::json& json, ReconcilePlan& value) {
+    value.mode = json.value("mode", std::string{});
+    value.sleep_s = json.value("sleep_s", 0.0);
+    value.poll_positions = json.value("poll_positions", true);
+    value.order_ids = json.value("order_ids", std::vector<std::string>{});
+}
+
+struct KillSwitchRequest {
+    std::string reason;
+    bool hard_close{true};
+};
+
+inline void to_json(nlohmann::json& json, const KillSwitchRequest& value) {
+    json = {
+        {"reason", value.reason},
+        {"hard_close", value.hard_close},
+    };
+}
+
+inline void from_json(const nlohmann::json& json, KillSwitchRequest& value) {
+    value.reason = json.value("reason", std::string{});
+    value.hard_close = json.value("hard_close", true);
+}
+
+struct StrategyRuntime {
+    config::SymbolConfig symbol;
+    std::shared_ptr<strategy::MicroEdgeStrategy> strategy;
+    double next_reconcile_at_monotonic{0.0};
+};
+
+class MicroEdgeApp {
+  public:
+    static constexpr int RECONCILE_BACKLOG_THRESHOLD = 32;
+
+    explicit MicroEdgeApp(config::AppConfig config)
+        : config_(std::move(config)),
+          rest_(
+              config_.base_url,
+              config_.rate_limit_per_second,
+              config_.order_rate_limit_per_second,
+              config_.poll_rate_limit_per_second
+          ),
+          account_risk_(config_.account_risk) {}
+
+    void set_strategy(std::shared_ptr<strategy::MicroEdgeStrategy> strategy_ptr) {
+        register_strategy(config_.symbol(), std::move(strategy_ptr));
+    }
+
+    void register_strategy(const config::SymbolConfig& symbol, std::shared_ptr<strategy::MicroEdgeStrategy> strategy_ptr) {
+        StrategyRuntime runtime{symbol, std::move(strategy_ptr)};
+        strategy_runtimes_[symbol.key()] = runtime;
+        for (const auto& key : symbol.stream_keys()) {
+            strategy_routes_[key] = symbol.key();
+        }
+    }
+
+    void on_board(const gateway::BoardSnapshot& snapshot) {
+        if (auto* runtime = resolve_runtime(snapshot.symbol, snapshot.exchange); runtime != nullptr) {
+            runtime->strategy->on_board(snapshot);
+        }
+    }
+
+    void on_trade(const gateway::TradePrint& trade) {
+        if (auto* runtime = resolve_runtime(trade.symbol, trade.exchange); runtime != nullptr) {
+            runtime->strategy->on_trade(trade);
+        }
+    }
+
+    void activate_kill_switch(const std::string& reason, bool hard_close = true) {
+        kill_switch_active_ = true;
+        kill_switch_reason_ = reason.empty() ? "manual_kill_switch" : reason;
+        kill_switch_hard_close_ = kill_switch_hard_close_ || hard_close;
+        for (auto& [_, runtime] : strategy_runtimes_) {
+            runtime.strategy->activate_kill_switch(kill_switch_reason_, kill_switch_hard_close_);
+        }
+    }
+
+    void set_rest_request_executor(gateway::KabuRestClient::RequestExecutor executor) {
+        rest_.set_request_executor(std::move(executor));
+    }
+
+    [[nodiscard]] gateway::KabuRestClient& rest() { return rest_; }
+    [[nodiscard]] const gateway::KabuRestClient& rest() const { return rest_; }
+
+    [[nodiscard]] std::vector<nlohmann::json> build_register_payload() const {
+        std::vector<nlohmann::json> payload;
+        payload.reserve(config_.symbols.size());
+        for (const auto& symbol : config_.symbols) {
+            payload.push_back({
+                {"Symbol", symbol.symbol},
+                {"Exchange", symbol.register_exchange()},
+            });
+        }
+        return payload;
+    }
+
+    nlohmann::json register_symbols() {
+        return rest_.register_symbols(build_register_payload());
+    }
+
+    void startup_with_retry(const std::function<void(double)>& sleeper = {}) {
+        const int max_retries = std::max(config_.startup_retry_count, 0);
+        const double delay_s = std::max(config_.startup_retry_delay_s, 0.0);
+        for (int attempt = 0; attempt <= max_retries; ++attempt) {
+            try {
+                rest_.get_token(config_.api_password);
+                break;
+            } catch (...) {
+                if (attempt >= max_retries) {
+                    throw;
+                }
+                if (sleeper) {
+                    sleeper(delay_s);
+                }
+            }
+        }
+        for (int attempt = 0; attempt <= max_retries; ++attempt) {
+            try {
+                register_symbols();
+                break;
+            } catch (...) {
+                if (attempt >= max_retries) {
+                    throw;
+                }
+                if (sleeper) {
+                    sleeper(delay_s);
+                }
+            }
+        }
+    }
+
+    void reregister_symbols() {
+        try {
+            register_symbols();
+        } catch (const gateway::KabuApiError& error) {
+            if (error.status() != 401 && error.status() != 403) {
+                throw;
+            }
+            rest_.get_token(config_.api_password);
+            register_symbols();
+        }
+    }
+
+    [[nodiscard]] ReconcilePlan build_reconcile_plan(strategy::MicroEdgeStrategy& strategy_obj) const {
+        const auto base_sleep_s = base_reconcile_interval_s();
+        const auto idle_sleep_s = std::max(base_sleep_s * 4.0, 2.0);
+        const auto& execution = strategy_obj.execution();
+        const auto active_order_ids = execution.active_order_ids();
+        if (execution.has_external_inventory_conflict() || execution.has_external_inventory) {
+            return {"drift", base_sleep_s, true, active_order_ids};
+        }
+        if (!active_order_ids.empty()) {
+            return {"orders", base_sleep_s, true, active_order_ids};
+        }
+        if (execution.inventory.qty > 0) {
+            return {"inventory", base_sleep_s, true, {}};
+        }
+        return {"idle", idle_sleep_s, true, {}};
+    }
+
+    [[nodiscard]] bool should_fast_track_reconcile(const ReconcilePlan& plan, strategy::MicroEdgeStrategy& strategy_obj) const {
+        return plan.mode != "idle" || has_abnormal_event_backlog(strategy_obj);
+    }
+
+    [[nodiscard]] bool has_abnormal_event_backlog(strategy::MicroEdgeStrategy& strategy_obj) const {
+        const auto runtime = strategy_obj.status().value("runtime", nlohmann::json::object());
+        const int backlog = runtime.value("event_backlog", 0);
+        const double queue_wait_p99_ms = runtime.value("queue_wait_p99_ms", 0.0);
+        return backlog >= RECONCILE_BACKLOG_THRESHOLD || queue_wait_p99_ms >= base_reconcile_interval_s() * 1000.0;
+    }
+
+    [[nodiscard]] risk::AccountRiskSnapshot account_risk_snapshot(
+        int additional_qty = 0,
+        double additional_price = 0.0
+    ) {
+        return account_risk_.evaluate(account_exposures(), account_realized_pnl(), additional_qty, additional_price);
+    }
+
+    [[nodiscard]] std::pair<bool, std::string> can_enter_account(int additional_qty = 0, double additional_price = 0.0) {
+        const auto snapshot = account_risk_snapshot(additional_qty, additional_price);
+        return {!snapshot.entry_blocked, snapshot.block_reason};
+    }
+
+    [[nodiscard]] std::function<std::pair<bool, std::string>(int, double)> make_account_entry_guard() {
+        return [this](int additional_qty, double additional_price) {
+            return this->can_enter_account(additional_qty, additional_price);
+        };
+    }
+
+    [[nodiscard]] std::optional<KillSwitchRequest> read_kill_switch_request() const {
+        const auto raw_path = std::filesystem::path(config_.kill_switch_path);
+        if (raw_path.empty() || !std::filesystem::exists(raw_path)) {
+            return std::nullopt;
+        }
+        std::ifstream in(raw_path);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (text.empty()) {
+            return KillSwitchRequest{"kill_switch_file:" + raw_path.filename().string(), true};
+        }
+        try {
+            const auto payload = nlohmann::json::parse(text);
+            if (!payload.is_object()) {
+                return KillSwitchRequest{"kill_switch_file:" + raw_path.filename().string(), true};
+            }
+            if (payload.contains("active") && !payload.at("active").get<bool>()) {
+                return std::nullopt;
+            }
+            const std::string mode = payload.value("mode", std::string("hard"));
+            bool hard_close = mode != "soft";
+            if (payload.contains("hard_close")) {
+                hard_close = payload.at("hard_close").get<bool>();
+            }
+            return KillSwitchRequest{payload.value("reason", std::string("kill_switch_file:" + raw_path.filename().string())), hard_close};
+        } catch (...) {
+            return KillSwitchRequest{text.size() <= 120 ? text : text.substr(0, 117) + "...", true};
+        }
+    }
+
+    bool poll_kill_switch() {
+        const auto request = read_kill_switch_request();
+        if (!request.has_value()) {
+            return false;
+        }
+        if (kill_switch_active_ && (kill_switch_hard_close_ || !request->hard_close)) {
+            return false;
+        }
+        activate_kill_switch(request->reason, request->hard_close);
+        return true;
+    }
+
+    [[nodiscard]] std::optional<std::map<std::string, gateway::OrderSnapshot>> collect_active_order_snapshots(
+        const std::vector<std::string>& order_ids
+    ) {
+        if (order_ids.empty()) {
+            return std::nullopt;
+        }
+
+        std::set<std::string> requested_ids;
+        for (const auto& order_id : order_ids) {
+            if (!order_id.empty()) {
+                requested_ids.insert(order_id);
+            }
+        }
+        if (requested_ids.empty()) {
+            return std::nullopt;
+        }
+
+        std::map<std::string, gateway::OrderSnapshot> snapshots;
+        for (const auto& order_id : requested_ids) {
+            std::vector<nlohmann::json> raws;
+            try {
+                raws = rest_.get_orders(order_id, 0, gateway::RequestLane::Poll);
+            } catch (...) {
+                return std::nullopt;
+            }
+            for (const auto& raw : raws) {
+                const auto snapshot = gateway::KabuAdapter::order_snapshot(raw);
+                if (!snapshot.has_value() || !requested_ids.contains(snapshot->order_id)) {
+                    continue;
+                }
+                snapshots[snapshot->order_id] = *snapshot;
+            }
+        }
+        return snapshots.empty() ? std::nullopt : std::optional<std::map<std::string, gateway::OrderSnapshot>>(snapshots);
+    }
+
+    [[nodiscard]] nlohmann::json status_snapshot() {
+        nlohmann::json strategies = nlohmann::json::array();
+        for (const auto& [_, runtime] : strategy_runtimes_) {
+            strategies.push_back(runtime.strategy->status());
+        }
+        return {
+            {"running", running_},
+            {"kill_switch_active", kill_switch_active_},
+            {"kill_switch_reason", kill_switch_reason_},
+            {"kill_switch_hard_close", kill_switch_hard_close_},
+            {"symbol_count", strategy_runtimes_.size()},
+            {"account_risk", account_risk_snapshot()},
+            {"strategies", strategies},
+        };
+    }
+
+    void set_running(bool running) { running_ = running; }
+
+    [[nodiscard]] const config::AppConfig& config() const { return config_; }
+    [[nodiscard]] const std::map<std::pair<std::string, int>, StrategyRuntime>& strategy_runtimes() const { return strategy_runtimes_; }
+    [[nodiscard]] bool kill_switch_active() const { return kill_switch_active_; }
+    [[nodiscard]] const std::string& kill_switch_reason() const { return kill_switch_reason_; }
+    [[nodiscard]] bool kill_switch_hard_close() const { return kill_switch_hard_close_; }
+
+  private:
+    [[nodiscard]] double base_reconcile_interval_s() const {
+        return std::max(config_.reconcile_interval_ms / 1000.0, 0.1);
+    }
+
+    [[nodiscard]] std::vector<risk::AccountExposure> account_exposures() const {
+        std::vector<risk::AccountExposure> exposures;
+        for (const auto& [_, runtime] : strategy_runtimes_) {
+            const auto& execution = runtime.strategy->execution();
+            int pending_entry_qty = 0;
+            double pending_entry_price = 0.0;
+            if (execution.has_working_entry() && execution.working_order.has_value()) {
+                pending_entry_qty = std::max(execution.working_order->qty - execution.working_order->cum_qty, 0);
+                pending_entry_price = execution.working_order->price;
+            }
+            exposures.push_back({
+                runtime.symbol.symbol,
+                execution.inventory.qty,
+                execution.inventory.avg_price,
+                pending_entry_qty,
+                pending_entry_price,
+            });
+        }
+        return exposures;
+    }
+
+    [[nodiscard]] double account_realized_pnl() {
+        double total = 0.0;
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            )
+                                .count();
+        for (auto& [_, runtime] : strategy_runtimes_) {
+            total += runtime.strategy->risk().snapshot(now_ns).daily_pnl;
+        }
+        return total;
+    }
+
+    [[nodiscard]] StrategyRuntime* resolve_runtime(const std::string& symbol, int exchange) {
+        const auto route_it = strategy_routes_.find({symbol, exchange});
+        if (route_it == strategy_routes_.end()) {
+            return nullptr;
+        }
+        auto it = strategy_runtimes_.find(route_it->second);
+        return it == strategy_runtimes_.end() ? nullptr : &it->second;
+    }
+
+    config::AppConfig config_;
+    gateway::KabuRestClient rest_;
+    risk::AccountRiskController account_risk_;
+    std::map<std::pair<std::string, int>, StrategyRuntime> strategy_runtimes_;
+    std::map<std::pair<std::string, int>, std::pair<std::string, int>> strategy_routes_;
+    bool running_{false};
+    bool kill_switch_active_{false};
+    std::string kill_switch_reason_;
+    bool kill_switch_hard_close_{false};
+};
+
+}  // namespace kabu::app

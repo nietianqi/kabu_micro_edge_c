@@ -1,0 +1,10 @@
+{
+  "realized_pnl": 0.0,
+  "total_inventory_qty": 300,
+  "total_pending_entry_qty": 0,
+  "total_projected_qty": 400,
+  "total_notional": 520350.0,
+  "projected_notional": 693850.0,
+  "entry_blocked": false,
+  "block_reason": ""
+}

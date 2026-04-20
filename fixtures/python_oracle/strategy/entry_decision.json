@@ -1,0 +1,7 @@
+{
+  "allow": true,
+  "reason": "",
+  "entry_mode": "taker",
+  "entry_score": 13,
+  "required_confirm": 1
+}

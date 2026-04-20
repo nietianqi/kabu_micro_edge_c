@@ -1,0 +1,21 @@
+{
+  "ts_ns": 1775520000300000000,
+  "obi_raw": 0.8471163526535308,
+  "lob_ofi_raw": 0.44680851063829785,
+  "tape_ofi_raw": 1.0,
+  "micro_momentum_raw": 1.604166666666515,
+  "microprice_tilt_raw": 0.4375,
+  "microprice": 1734.96875,
+  "mid": 1734.75,
+  "obi_z": 0.0,
+  "lob_ofi_z": 0.0,
+  "tape_ofi_z": 0.0,
+  "micro_momentum_z": 0.0,
+  "microprice_tilt_z": 0.0,
+  "composite": 0.0,
+  "mid_std_ticks": 0.0,
+  "secondary_score": 0,
+  "microprice_gap_ticks": 0.4375,
+  "integrated_ofi": 0.7234042553191489,
+  "trade_burst_score": 1.0
+}

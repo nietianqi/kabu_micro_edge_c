@@ -1,0 +1,32 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+Testing/
+
+# vcpkg
+vcpkg_installed/
+
+# Logs and runtime
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.user
+
+# Claude Code internal
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
