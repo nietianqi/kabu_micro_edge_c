@@ -19,6 +19,8 @@ namespace kabu::execution {
 
 class ExecutionController {
   public:
+    enum class TseTickProfile { Other, Topix100 };
+
     ExecutionController(
         std::string symbol,
         int exchange,
@@ -285,33 +287,22 @@ class ExecutionController {
 
     [[nodiscard]] double get_tse_order_tick(double ref_price) const {
         const double price = std::max(ref_price, tick_size_);
-        if (topix100_) {
-            if (price <= 1000.0) return 0.1;
-            if (price <= 3000.0) return 0.5;
-            if (price <= 5000.0) return 1.0;
-            if (price <= 10000.0) return 1.0;
-            if (price <= 30000.0) return 5.0;
-            if (price <= 50000.0) return 10.0;
-            if (price <= 100000.0) return 10.0;
-            if (price <= 300000.0) return 50.0;
-            if (price <= 500000.0) return 100.0;
-            if (price <= 1000000.0) return 100.0;
-            if (price <= 3000000.0) return 500.0;
-            if (price <= 10000000.0) return 1000.0;
-            if (price <= 30000000.0) return 5000.0;
-            return 10000.0;
+        if (!tse_tick_profile_.has_value() && price > 0.0) {
+            const double configured_tick = std::max(tick_size_, 1e-9);
+            const double other_tick = tick_from_table(price, false);
+            const double topix_tick = tick_from_table(price, true);
+            const bool other_match = std::abs(configured_tick - other_tick) <= 1e-9;
+            const bool topix_match = std::abs(configured_tick - topix_tick) <= 1e-9;
+            if (other_match && !topix_match) {
+                tse_tick_profile_ = TseTickProfile::Other;
+            } else if (topix_match && !other_match) {
+                tse_tick_profile_ = TseTickProfile::Topix100;
+            }
         }
-        if (price <= 3000.0) return 1.0;
-        if (price <= 5000.0) return 5.0;
-        if (price <= 30000.0) return 10.0;
-        if (price <= 50000.0) return 50.0;
-        if (price <= 300000.0) return 100.0;
-        if (price <= 500000.0) return 500.0;
-        if (price <= 3000000.0) return 1000.0;
-        if (price <= 5000000.0) return 5000.0;
-        if (price <= 30000000.0) return 10000.0;
-        if (price <= 50000000.0) return 50000.0;
-        return 100000.0;
+        if (tse_tick_profile_.has_value()) {
+            return tick_from_table(price, *tse_tick_profile_ == TseTickProfile::Topix100);
+        }
+        return std::max(tick_size_, 1e-9);
     }
 
     [[nodiscard]] nlohmann::json snapshot() const {
@@ -358,6 +349,37 @@ class ExecutionController {
     }
 
   private:
+    [[nodiscard]] static double tick_from_table(double reference, bool topix100) {
+        const double price = std::max(reference, 0.0);
+        if (topix100) {
+            if (price <= 1000.0) return 0.1;
+            if (price <= 3000.0) return 0.5;
+            if (price <= 5000.0) return 1.0;
+            if (price <= 10000.0) return 1.0;
+            if (price <= 30000.0) return 5.0;
+            if (price <= 50000.0) return 10.0;
+            if (price <= 100000.0) return 10.0;
+            if (price <= 300000.0) return 50.0;
+            if (price <= 500000.0) return 100.0;
+            if (price <= 1000000.0) return 100.0;
+            if (price <= 3000000.0) return 500.0;
+            if (price <= 10000000.0) return 1000.0;
+            if (price <= 30000000.0) return 5000.0;
+            return 10000.0;
+        }
+        if (price <= 3000.0) return 1.0;
+        if (price <= 5000.0) return 5.0;
+        if (price <= 30000.0) return 10.0;
+        if (price <= 50000.0) return 50.0;
+        if (price <= 300000.0) return 100.0;
+        if (price <= 500000.0) return 500.0;
+        if (price <= 3000000.0) return 1000.0;
+        if (price <= 5000000.0) return 5000.0;
+        if (price <= 30000000.0) return 10000.0;
+        if (price <= 50000000.0) return 50000.0;
+        return 100000.0;
+    }
+
     [[nodiscard]] static std::int64_t wall_clock_ns() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::system_clock::now().time_since_epoch()
@@ -567,6 +589,7 @@ class ExecutionController {
     bool allow_aggressive_exit_{false};
     bool topix100_{false};
     bool queue_model_{true};
+    mutable std::optional<TseTickProfile> tse_tick_profile_;
     int paper_order_counter_{0};
     oms::OrderLedger order_ledger_;
 };

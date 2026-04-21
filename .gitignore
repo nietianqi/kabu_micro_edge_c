@@ -13,11 +13,13 @@ install_manifest.txt
 Testing/
 
 # vcpkg
+vcpkg/
 vcpkg_installed/
 
 # Logs and runtime
 logs/
 *.log
+config.json
 
 # IDE
 .idea/
