@@ -62,6 +62,10 @@ target_link_libraries(
     ${KABU_SPDLOG_TARGET}
 )
 
+if(WIN32)
+  target_link_libraries(kabu_micro_edge_core INTERFACE winhttp)
+endif()
+
 add_executable(kabu_micro_edge src/main.cpp)
 target_link_libraries(kabu_micro_edge PRIVATE kabu_micro_edge_core)
 
@@ -87,6 +91,7 @@ if(BUILD_TESTING)
     tests/test_gateway.cpp
     tests/test_journal.cpp
     tests/test_latency_report.cpp
+    tests/test_live_rest_executor.cpp
     tests/test_oms.cpp
     tests/test_python_oracle.cpp
     tests/test_replay.cpp

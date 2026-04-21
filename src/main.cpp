@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <filesystem>
 #include <thread>
 #include <vector>
 
@@ -16,6 +17,7 @@
 
 #include "kabu_micro_edge/app.hpp"
 #include "kabu_micro_edge/config.hpp"
+#include "kabu_micro_edge/live_rest_executor.hpp"
 #include "kabu_micro_edge/strategy.hpp"
 
 namespace {
@@ -86,6 +88,10 @@ int main(int argc, char** argv) {
         const auto config = config_path.empty() ? kabu::config::load_config() : kabu::config::load_config(config_path);
         kabu::app::MicroEdgeApp app(config);
         app.set_running(true);
+        if (!config.dry_run) {
+            app.set_rest_request_executor(kabu::gateway::make_live_rest_request_executor(app.rest()));
+            app.rest().start();
+        }
 
         std::vector<std::shared_ptr<kabu::strategy::MicroEdgeStrategy>> strategies;
         strategies.reserve(config.symbols.size());
@@ -117,6 +123,13 @@ int main(int argc, char** argv) {
             if (is_placeholder_password(config.api_password)) {
                 std::cerr << "Live mode requires config.api_password to be set to a real kabus API password.\n";
                 return 2;
+            }
+
+            if (!config.kill_switch_path.empty()) {
+                const std::filesystem::path kill_switch_path(config.kill_switch_path);
+                if (kill_switch_path.has_parent_path()) {
+                    std::filesystem::create_directories(kill_switch_path.parent_path());
+                }
             }
 
             app.startup_with_retry([](double delay_s) {
