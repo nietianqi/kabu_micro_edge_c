@@ -2,8 +2,6 @@
   "name": "kabu-micro-edge-c",
   "version-string": "0.1.0",
   "dependencies": [
-    "boost-asio",
-    "boost-beast",
     "gtest",
     "nlohmann-json",
     "spdlog"

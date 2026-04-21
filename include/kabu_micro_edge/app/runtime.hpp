@@ -279,7 +279,7 @@ class MicroEdgeApp {
         const std::vector<std::string> reconcile_order_ids(order_id_set.begin(), order_id_set.end());
         const bool needs_positions = execution.inventory.qty > 0 || execution.has_external_inventory || execution.manual_close_lock ||
                                      execution.has_stranded_partial;
-        if (execution.has_external_inventory_conflict() || execution.has_external_inventory) {
+        if (execution.has_external_inventory_conflict()) {
             return {"drift", base_sleep_s, needs_positions, reconcile_order_ids};
         }
         if (!reconcile_order_ids.empty()) {
