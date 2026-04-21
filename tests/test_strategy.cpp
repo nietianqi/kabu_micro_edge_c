@@ -180,7 +180,7 @@ TEST(StrategyTest, RecoveryGateBlocksNewEntriesInLiveMode) {
     config.strategy.limit_tp_delay_seconds = 0.0;
 
     kabu::app::MicroEdgeApp app(config);
-    app.set_recovery_state(true, "startup_recovery");
+    app.begin_startup_recovery();
 
     kabu::strategy::MicroEdgeStrategy strategy(
         config.symbol(),

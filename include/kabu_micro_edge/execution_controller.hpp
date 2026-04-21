@@ -337,6 +337,14 @@ class ExecutionController {
     [[nodiscard]] nlohmann::json snapshot() const {
         const auto* primary_order = working_order.has_value() ? &*working_order : (exit_order.has_value() ? &*exit_order : nullptr);
         const auto consistency = consistency_issues();
+        nlohmann::json consistency_json = nlohmann::json::array();
+        for (const auto& issue : consistency) {
+            consistency_json.push_back({
+                {"code", issue.code},
+                {"severity", issue.severity},
+                {"message", issue.message},
+            });
+        }
         return {
             {"state", to_string(state())},
             {"inventory_side", inventory.side},
@@ -370,6 +378,7 @@ class ExecutionController {
             {"stats", stats},
             {"consistency_ok", consistency.empty()},
             {"consistency_issue_count", consistency.size()},
+            {"consistency_issues", consistency_json},
             {"ledger", order_ledger_.snapshot()},
         };
     }
@@ -549,6 +558,34 @@ class ExecutionController {
         }
         if (broker_closable_qty > broker_hold_qty) {
             issues.push_back({"broker_closable_gt_hold", "high", "broker closable quantity exceeds broker hold quantity"});
+        }
+        if (has_external_inventory && broker_hold_qty <= 0) {
+            issues.push_back({
+                "external_inventory_without_broker_qty",
+                "high",
+                "external inventory flag is set while broker hold quantity is flat",
+            });
+        }
+        if (!has_external_inventory && !has_working_orders() && inventory.qty > 0 && broker_hold_qty > 0 && broker_hold_qty != inventory.qty) {
+            issues.push_back({
+                "inventory_broker_mismatch_unflagged",
+                "high",
+                "local inventory and broker hold quantity diverge without an external inventory flag",
+            });
+        }
+        if (has_external_active_orders && broker_active_order_ids.empty()) {
+            issues.push_back({
+                "external_active_orders_flag_mismatch",
+                "medium",
+                "external active orders flag is set but broker active order ids are empty",
+            });
+        }
+        if (manual_close_lock && broker_hold_qty <= 0) {
+            issues.push_back({
+                "manual_close_without_broker_hold",
+                "medium",
+                "manual close lock is set while broker hold quantity is flat",
+            });
         }
 
         const auto local_ids = active_order_ids();

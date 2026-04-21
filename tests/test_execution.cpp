@@ -357,3 +357,35 @@ TEST(ExecutionTest, ConsistencyIssuesDetectBrokerClosableExceedingHold) {
     EXPECT_EQ(issues.front().code, "broker_closable_gt_hold");
     EXPECT_FALSE(controller.snapshot().at("consistency_ok").get<bool>());
 }
+
+TEST(ExecutionTest, ConsistencyIssuesDetectUnflaggedInventoryBrokerMismatch) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    controller.inventory.side = 1;
+    controller.inventory.qty = 100;
+    controller.broker_hold_qty = 200;
+    controller.broker_closable_qty = 200;
+    controller.has_external_inventory = false;
+
+    const auto issues = controller.consistency_issues();
+    ASSERT_FALSE(issues.empty());
+    EXPECT_EQ(issues.front().code, "inventory_broker_mismatch_unflagged");
+
+    const auto snapshot = controller.snapshot();
+    EXPECT_EQ(snapshot.at("consistency_issue_count").get<int>(), 1);
+    ASSERT_EQ(snapshot.at("consistency_issues").size(), 1U);
+    EXPECT_EQ(snapshot.at("consistency_issues")[0].at("code").get<std::string>(), "inventory_broker_mismatch_unflagged");
+}

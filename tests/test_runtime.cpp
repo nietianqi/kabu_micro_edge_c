@@ -172,6 +172,29 @@ TEST(RuntimeTest, RecoveryStateTransitionsFromStartupToReady) {
     EXPECT_GT(status.at("recovery_completed_ts_ns").get<std::int64_t>(), 0);
 }
 
+TEST(RuntimeTest, RecoveryStateTransitionsFromReconnectToReady) {
+    auto config = kabu::config::load_config();
+    auto strategy = make_strategy(config, "7269", 9);
+
+    kabu::app::MicroEdgeApp app(config);
+    app.set_strategy(strategy);
+    app.begin_reconnect_recovery();
+
+    auto status = app.status_snapshot();
+    EXPECT_TRUE(status.at("recovery_in_progress").get<bool>());
+    EXPECT_EQ(status.at("recovery_state").get<std::string>(), "reconnect_recovery");
+    EXPECT_EQ(status.at("recovery_reason").get<std::string>(), "websocket_reconnect_recovery");
+
+    const auto guard = app.make_account_entry_guard();
+    const auto [allowed, reason] = guard(100, 1735.0);
+    EXPECT_FALSE(allowed);
+    EXPECT_EQ(reason, "websocket_reconnect_recovery");
+
+    app.finish_recovery();
+    status = app.status_snapshot();
+    EXPECT_EQ(status.at("recovery_state").get<std::string>(), "ready");
+}
+
 TEST(RuntimeTest, StatusSnapshotAggregatesStrategyConsistencyIssues) {
     auto config = kabu::config::load_config();
     auto strategy = make_strategy(config, "7269", 9);
