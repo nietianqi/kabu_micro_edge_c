@@ -163,9 +163,9 @@ class TradeJournal {
 
         return {
             {"trade_count", trade_count_},
-            {"pending_markouts", 0},
-            {"pending_post_exit_markouts", 0},
-            {"pending_entry_markouts", 0},
+            {"pending_markouts", pending_markouts_.size() + pending_entry_markouts_.size()},
+            {"pending_post_exit_markouts", pending_markouts_.size()},
+            {"pending_entry_markouts", pending_entry_markouts_.size()},
             {"markout_horizons", post_exit_horizons},
             {"post_exit_horizons", post_exit_horizons},
             {"entry_horizons", entry_horizons},

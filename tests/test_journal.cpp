@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -59,4 +60,24 @@ TEST(JournalTest, CloseFlushesPendingMarkout) {
     const auto snapshot = journal.snapshot();
     EXPECT_TRUE(snapshot.contains("post_exit_horizons"));
     EXPECT_TRUE(snapshot.contains("entry_horizons"));
+}
+
+TEST(JournalTest, SnapshotTracksPendingMarkoutsBeforeClose) {
+    const auto dir = make_temp_dir("journal_pending");
+    kabu::TradeJournal journal(
+        dir / "trades.csv",
+        30,
+        std::vector<double>{0.5, 1.0},
+        std::vector<double>{0.2, 0.5}
+    );
+    journal.open();
+    journal.schedule_markout(make_round_trip(), {10050.0});
+    journal.schedule_entry_markout("9984", 1, 100, 9980.0, 1'700'000'000'000'000'000LL, "taker", 5, "quote_cross", 0, {10010.0});
+
+    const auto snapshot = journal.snapshot();
+    EXPECT_EQ(snapshot["pending_post_exit_markouts"].get<int>(), 2);
+    EXPECT_EQ(snapshot["pending_entry_markouts"].get<int>(), 2);
+    EXPECT_EQ(snapshot["pending_markouts"].get<int>(), 4);
+
+    journal.close();
 }

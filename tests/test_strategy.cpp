@@ -1,4 +1,6 @@
 #include <filesystem>
+#include <memory>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -36,7 +38,7 @@ kabu::gateway::TradePrint make_trade(std::int64_t ts_ns, double price, int side,
     return {"7269", 9, ts_ns, price, size, side, size};
 }
 
-kabu::strategy::MicroEdgeStrategy make_strategy() {
+kabu::strategy::MicroEdgeStrategy make_strategy(std::shared_ptr<kabu::TradeJournal> journal = nullptr) {
     auto config = kabu::config::load_config();
     config.symbol().symbol = "7269";
     config.symbol().exchange = 9;
@@ -55,7 +57,14 @@ kabu::strategy::MicroEdgeStrategy make_strategy() {
     config.strategy.limit_tp_order_interval_ms = 0;
     config.strategy.limit_tp_delay_seconds = 0.0;
     config.strategy.aggressive_taker_mode = false;
-    return {config.symbol(), config.strategy, config.order_profile, true};
+    return {config.symbol(), config.strategy, config.order_profile, true, std::move(journal)};
+}
+
+std::filesystem::path make_temp_dir(const std::string& name) {
+    auto path = std::filesystem::temp_directory_path() / ("kabu_micro_edge_c_strategy_" + name);
+    std::filesystem::remove_all(path);
+    std::filesystem::create_directories(path);
+    return path;
 }
 
 }  // namespace
@@ -134,4 +143,61 @@ TEST(StrategyTest, KillSwitchBlocksNewEntries) {
     EXPECT_TRUE(status["risk"]["kill_switch_active"].get<bool>());
     EXPECT_EQ(status["risk"]["kill_switch_reason"].get<std::string>(), "manual_test");
     EXPECT_EQ(status["risk"]["last_entry_block_reason"].get<std::string>(), "kill_switch");
+}
+
+TEST(StrategyTest, ScaleInRequiresLiveTpWorkflow) {
+    auto strategy = make_strategy();
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 100;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = first_ts - 1'000'000;
+    strategy.execution().exit_order = kabu::execution::WorkingOrder{
+        "EXIT-1",
+        "exit",
+        -1,
+        100,
+        1735.0,
+        false,
+        first_ts - 1'000'000,
+        "limit_tp_quote"
+    };
+    strategy.execution().exit_order->cancel_requested = true;
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_FALSE(strategy.execution().has_working_entry());
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "scale_in_blocked");
+}
+
+TEST(StrategyTest, EntryFillSchedulesEntryMarkoutInAnalytics) {
+    const auto dir = make_temp_dir("entry_markout");
+    auto journal = std::make_shared<kabu::TradeJournal>(
+        dir / "trades.csv",
+        30,
+        std::vector<double>{},
+        std::vector<double>{0.2, 0.5}
+    );
+    journal->open();
+
+    auto strategy = make_strategy(journal);
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    const auto markout = strategy.status()["analytics"]["markout"];
+    EXPECT_EQ(markout["pending_post_exit_markouts"].get<int>(), 0);
+    EXPECT_EQ(markout["pending_entry_markouts"].get<int>(), 2);
+    EXPECT_EQ(markout["pending_markouts"].get<int>(), 2);
+
+    journal->close();
 }

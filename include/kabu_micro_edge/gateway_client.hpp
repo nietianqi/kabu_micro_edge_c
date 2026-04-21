@@ -150,6 +150,7 @@ class KabuRestClient {
             const bool should_retry =
                 (response.status == 429 || response.status == 500 || response.status == 502 ||
                  response.status == 503 || response.status == 504) &&
+                path != "/kabusapi/token" && path != "/kabusapi/register" &&
                 path != "/kabusapi/sendorder" && path != "/kabusapi/sendorder/future" &&
                 path != "/kabusapi/sendorder/option" && path != "/kabusapi/cancelorder";
             if (!should_retry || attempt >= 2) {
