@@ -233,6 +233,26 @@ class MicroEdgeStrategy {
                    : 0;
     }
 
+    [[nodiscard]] bool can_scale_in_with_live_tp() const {
+        if (position_timeout_exit_required_) {
+            return false;
+        }
+        if (!execution_.exit_order.has_value()) {
+            return false;
+        }
+        const auto& exit_order = *execution_.exit_order;
+        if (exit_order.cancel_requested) {
+            return false;
+        }
+        if (!exit_order.reason.starts_with("limit_tp")) {
+            return false;
+        }
+        if (execution_.inventory.qty <= 0 || execution_.inventory.side <= 0) {
+            return false;
+        }
+        return round_scale_in_count_ < config_.max_scale_in_per_round_trip;
+    }
+
     bool validate_market_quality(std::int64_t now_ns, std::string& reason) const {
         if (!latest_board_.has_value() || !latest_signal_.has_value()) { reason = "startup"; return false; }
         const auto& board = *latest_board_;
@@ -250,10 +270,10 @@ class MicroEdgeStrategy {
         if (!latest_board_.has_value() || !latest_signal_.has_value() || kill_switch_active_) { last_entry_block_reason_ = kill_switch_active_ ? "kill_switch" : last_entry_block_reason_; return; }
         std::string market_reason; if (!validate_market_quality(now_ns, market_reason)) { last_entry_block_reason_ = market_reason; long_confirm_ = 0; return; }
         if (execution_.has_working_entry()) { last_entry_block_reason_ = "working_order"; return; }
+        if (execution_.inventory.qty > 0 && !can_scale_in_with_live_tp()) { last_entry_block_reason_ = "scale_in_blocked"; return; }
         if (execution_.has_external_inventory_conflict()) { last_entry_block_reason_ = "external_inventory"; return; }
         const auto risk_gate = risk_.can_enter(now_ns); if (!risk_gate.first) { last_entry_block_reason_ = risk_gate.second; return; }
         const auto decision = evaluate_long_signal(*latest_board_, *latest_signal_, config_); if (!decision.allow) { last_entry_block_reason_ = decision.reason; long_confirm_ = 0; return; }
-        if (execution_.inventory.qty > 0 && round_scale_in_count_ >= config_.max_scale_in_per_round_trip) { last_entry_block_reason_ = "scale_in_blocked"; return; }
         if (entry_guard_) { const auto guard = entry_guard_(config_.trade_volume, latest_board_->ask); if (!guard.first) { last_entry_block_reason_ = guard.second; return; } }
         if (now_ns - last_entry_order_action_ns_ < static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) { last_entry_block_reason_ = "entry_interval"; return; }
         if (++long_confirm_ < decision.required_confirm) { last_entry_block_reason_ = "confirming"; return; }
@@ -351,7 +371,16 @@ class MicroEdgeStrategy {
 
     void post_execution_update(std::int64_t now_ns) {
         const int current_qty = execution_.inventory.qty;
+        const double current_avg_price = execution_.inventory.avg_price;
         if (current_qty > observed_inventory_qty_) {
+            const int fill_qty = current_qty - observed_inventory_qty_;
+            const double fill_price = execution::ExecutionController::incremental_fill_price(
+                observed_inventory_qty_,
+                observed_inventory_avg_price_,
+                current_qty,
+                current_avg_price
+            );
+            const auto fill_ts_ns = execution_.inventory.opened_ts_ns;
             if (observed_inventory_qty_ == 0 && latest_signal_.has_value()) round_trip_entry_signal_ = latest_signal_;
             last_entry_mode_ = execution_.inventory.entry_mode.empty() ? working_entry_mode_ : execution_.inventory.entry_mode;
             last_entry_score_ = std::max(execution_.inventory.entry_score, working_entry_score_);
@@ -362,12 +391,33 @@ class MicroEdgeStrategy {
             if (bucket_it != entry_fill_counts_.end()) {
                 ++bucket_it->second;
             }
+            if (journal_ != nullptr && fill_qty > 0 && fill_price > 0 && fill_ts_ns > 0) {
+                int queue_ahead_qty = execution_.inventory.entry_queue_ahead_qty;
+                if (execution_.working_order.has_value()) {
+                    queue_ahead_qty = std::max(queue_ahead_qty, execution_.working_order->initial_queue_ahead_qty);
+                }
+                journal_->schedule_entry_markout(
+                    symbol_config_.symbol,
+                    execution_.inventory.side,
+                    fill_qty,
+                    fill_price,
+                    fill_ts_ns,
+                    !working_entry_mode_.empty() ? working_entry_mode_
+                                                 : (!execution_.inventory.entry_mode.empty() ? execution_.inventory.entry_mode : last_entry_mode_),
+                    working_entry_score_ > 0 ? working_entry_score_
+                                             : (execution_.inventory.entry_score > 0 ? execution_.inventory.entry_score : last_entry_score_),
+                    !execution_.paper_last_fill_reason.empty() ? execution_.paper_last_fill_reason : execution_.inventory.entry_fill_reason,
+                    queue_ahead_qty,
+                    mid_ref_
+                );
+            }
         }
         if (working_entry_is_scale_in_ && current_qty > observed_inventory_qty_ && !working_entry_scale_in_counted_) {
             ++round_scale_in_count_;
             working_entry_scale_in_counted_ = true;
         }
         observed_inventory_qty_ = current_qty;
+        observed_inventory_avg_price_ = current_avg_price;
         for (const auto& trade : execution_.drain_round_trips()) {
             risk_.on_round_trip(trade, now_ns);
             if (trade.exit_reason.starts_with("limit_tp")) ++tp_fill_count_;
@@ -458,6 +508,7 @@ class MicroEdgeStrategy {
     bool working_entry_is_scale_in_{false};
     bool working_entry_scale_in_counted_{false};
     int observed_inventory_qty_{0};
+    double observed_inventory_avg_price_{0.0};
     int observed_inventory_qty_before_close_{0};
     std::string last_entry_block_reason_{"startup"};
     bool need_submit_limit_tp_{false};
