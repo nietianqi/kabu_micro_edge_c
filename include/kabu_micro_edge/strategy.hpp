@@ -448,7 +448,9 @@ class MicroEdgeStrategy {
                 current_qty,
                 current_avg_price
             );
-            const auto fill_ts_ns = execution_.inventory.opened_ts_ns;
+            const auto fill_ts_ns = execution_.inventory.last_entry_fill_ts_ns > 0
+                                        ? execution_.inventory.last_entry_fill_ts_ns
+                                        : execution_.inventory.opened_ts_ns;
             if (observed_inventory_qty_ == 0 && latest_signal_.has_value()) round_trip_entry_signal_ = latest_signal_;
             last_entry_mode_ = execution_.inventory.entry_mode.empty() ? working_entry_mode_ : execution_.inventory.entry_mode;
             last_entry_score_ = std::max(execution_.inventory.entry_score, working_entry_score_);

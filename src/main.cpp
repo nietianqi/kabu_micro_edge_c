@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
             for (const auto& strategy : strategies) {
                 strategy->on_timer(timestamp_ns);
             }
-            app.poll_kill_switch();
+            app.maybe_poll_kill_switch(std::chrono::duration<double>(loop_now.time_since_epoch()).count());
 
             if (!config.dry_run) {
                 run_reconcile_cycle(app);

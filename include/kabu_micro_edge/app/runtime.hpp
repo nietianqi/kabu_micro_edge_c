@@ -364,6 +364,19 @@ class MicroEdgeApp {
         return true;
     }
 
+    bool maybe_poll_kill_switch(double now_monotonic_s = monotonic_now_s()) {
+        if (config_.kill_switch_poll_interval_ms <= 0) {
+            return false;
+        }
+        const double interval_s = static_cast<double>(config_.kill_switch_poll_interval_ms) / 1000.0;
+        if (last_kill_switch_check_monotonic_ > 0.0 &&
+            now_monotonic_s - last_kill_switch_check_monotonic_ < interval_s) {
+            return false;
+        }
+        last_kill_switch_check_monotonic_ = now_monotonic_s;
+        return poll_kill_switch();
+    }
+
     [[nodiscard]] std::optional<std::map<std::string, gateway::OrderSnapshot>> collect_active_order_snapshots(
         const std::vector<std::string>& order_ids
     ) {
@@ -383,14 +396,9 @@ class MicroEdgeApp {
 
         std::map<std::string, gateway::OrderSnapshot> snapshots;
         for (const auto& order_id : requested_ids) {
-            std::vector<nlohmann::json> raws;
-            try {
-                raws = with_authorization_retry(
-                    [&]() { return rest_.get_orders(order_id, 0, gateway::RequestLane::Poll); }
-                );
-            } catch (...) {
-                return std::nullopt;
-            }
+            const auto raws = with_authorization_retry(
+                [&]() { return rest_.get_orders(order_id, 0, gateway::RequestLane::Poll); }
+            );
             merge_order_snapshots(snapshots, raws, requested_ids);
         }
         return snapshots.empty() ? std::nullopt : std::optional<std::map<std::string, gateway::OrderSnapshot>>(snapshots);
@@ -516,6 +524,10 @@ class MicroEdgeApp {
             .count();
     }
 
+    [[nodiscard]] static double monotonic_now_s() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     [[nodiscard]] double base_reconcile_interval_s() const {
         return std::max(config_.reconcile_interval_ms / 1000.0, 0.1);
     }
@@ -587,6 +599,7 @@ class MicroEdgeApp {
     std::string recovery_reason_;
     std::int64_t recovery_started_ts_ns_{0};
     std::int64_t recovery_completed_ts_ns_{0};
+    double last_kill_switch_check_monotonic_{0.0};
 };
 
 }  // namespace kabu::app
