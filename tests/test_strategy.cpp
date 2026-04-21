@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include "kabu_micro_edge/app/runtime.hpp"
 #include "kabu_micro_edge/config.hpp"
 #include "kabu_micro_edge/strategy.hpp"
 
@@ -157,6 +158,54 @@ TEST(StrategyTest, KillSwitchBlocksNewEntries) {
     EXPECT_TRUE(status["risk"]["kill_switch_active"].get<bool>());
     EXPECT_EQ(status["risk"]["kill_switch_reason"].get<std::string>(), "manual_test");
     EXPECT_EQ(status["risk"]["last_entry_block_reason"].get<std::string>(), "kill_switch");
+}
+
+TEST(StrategyTest, RecoveryGateBlocksNewEntriesInLiveMode) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::app::MicroEdgeApp app(config);
+    app.set_recovery_state(true, "startup_recovery");
+
+    kabu::strategy::MicroEdgeStrategy strategy(
+        config.symbol(),
+        config.strategy,
+        config.order_profile,
+        false,
+        nullptr,
+        app.make_account_entry_guard()
+    );
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+
+    EXPECT_NO_THROW({
+        strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+        strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+        strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+    });
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    const auto status = strategy.status();
+    EXPECT_TRUE(status["risk"]["account_entry_blocked"].get<bool>());
+    EXPECT_EQ(status["risk"]["account_entry_block_reason"].get<std::string>(), "startup_recovery");
+    EXPECT_EQ(status["risk"]["last_entry_block_reason"].get<std::string>(), "startup_recovery");
 }
 
 TEST(StrategyTest, ScaleInRequiresLiveTpWorkflow) {

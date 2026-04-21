@@ -68,6 +68,11 @@ struct StrategyRuntime {
     double next_reconcile_at_monotonic{0.0};
 };
 
+struct ReconcileFetchResult {
+    std::optional<std::vector<nlohmann::json>> positions;
+    std::optional<std::map<std::string, gateway::OrderSnapshot>> order_snapshots;
+};
+
 class MicroEdgeApp {
   public:
     static constexpr int RECONCILE_BACKLOG_THRESHOLD = 32;
@@ -219,22 +224,33 @@ class MicroEdgeApp {
         last_reconcile_error_ = std::move(message);
     }
     void note_reconcile_success() { last_reconcile_error_.clear(); }
+    void set_recovery_state(bool in_progress, std::string reason = {}) {
+        recovery_in_progress_ = in_progress;
+        recovery_reason_ = in_progress ? (reason.empty() ? "recovery_in_progress" : std::move(reason)) : std::string{};
+    }
+    [[nodiscard]] bool recovery_in_progress() const { return recovery_in_progress_; }
+    [[nodiscard]] const std::string& recovery_reason() const { return recovery_reason_; }
 
     [[nodiscard]] ReconcilePlan build_reconcile_plan(strategy::MicroEdgeStrategy& strategy_obj) const {
         const auto base_sleep_s = base_reconcile_interval_s();
         const auto idle_sleep_s = std::max(base_sleep_s * 4.0, 2.0);
         const auto& execution = strategy_obj.execution();
         const auto active_order_ids = execution.active_order_ids();
+        std::set<std::string> order_id_set(active_order_ids.begin(), active_order_ids.end());
+        order_id_set.insert(execution.broker_active_order_ids.begin(), execution.broker_active_order_ids.end());
+        const std::vector<std::string> reconcile_order_ids(order_id_set.begin(), order_id_set.end());
+        const bool needs_positions = execution.inventory.qty > 0 || execution.has_external_inventory || execution.manual_close_lock ||
+                                     execution.has_stranded_partial;
         if (execution.has_external_inventory_conflict() || execution.has_external_inventory) {
-            return {"drift", base_sleep_s, true, active_order_ids};
+            return {"drift", base_sleep_s, needs_positions, reconcile_order_ids};
         }
-        if (!active_order_ids.empty()) {
-            return {"orders", base_sleep_s, true, active_order_ids};
+        if (!reconcile_order_ids.empty()) {
+            return {"orders", base_sleep_s, needs_positions, reconcile_order_ids};
         }
         if (execution.inventory.qty > 0) {
             return {"inventory", base_sleep_s, true, {}};
         }
-        return {"idle", idle_sleep_s, true, {}};
+        return {"idle", idle_sleep_s, false, {}};
     }
 
     [[nodiscard]] bool should_fast_track_reconcile(const ReconcilePlan& plan, strategy::MicroEdgeStrategy& strategy_obj) const {
@@ -242,9 +258,9 @@ class MicroEdgeApp {
     }
 
     [[nodiscard]] bool has_abnormal_event_backlog(strategy::MicroEdgeStrategy& strategy_obj) const {
-        const auto runtime = strategy_obj.status().value("runtime", nlohmann::json::object());
-        const int backlog = runtime.value("event_backlog", 0);
-        const double queue_wait_p99_ms = runtime.value("queue_wait_p99_ms", 0.0);
+        const auto runtime = strategy_obj.runtime_metrics();
+        const int backlog = runtime.event_backlog;
+        const double queue_wait_p99_ms = runtime.queue_wait_p99_ms;
         return backlog >= RECONCILE_BACKLOG_THRESHOLD || queue_wait_p99_ms >= base_reconcile_interval_s() * 1000.0;
     }
 
@@ -256,6 +272,9 @@ class MicroEdgeApp {
     }
 
     [[nodiscard]] std::pair<bool, std::string> can_enter_account(int additional_qty = 0, double additional_price = 0.0) {
+        if (recovery_in_progress_) {
+            return {false, recovery_reason_.empty() ? "recovery_in_progress" : recovery_reason_};
+        }
         const auto snapshot = account_risk_snapshot(additional_qty, additional_price);
         return {!snapshot.entry_blocked, snapshot.block_reason};
     }
@@ -334,15 +353,46 @@ class MicroEdgeApp {
             } catch (...) {
                 return std::nullopt;
             }
-            for (const auto& raw : raws) {
-                const auto snapshot = gateway::KabuAdapter::order_snapshot(raw);
-                if (!snapshot.has_value() || !requested_ids.contains(snapshot->order_id)) {
-                    continue;
-                }
-                snapshots[snapshot->order_id] = *snapshot;
-            }
+            merge_order_snapshots(snapshots, raws, requested_ids);
         }
         return snapshots.empty() ? std::nullopt : std::optional<std::map<std::string, gateway::OrderSnapshot>>(snapshots);
+    }
+
+    [[nodiscard]] ReconcileFetchResult collect_startup_recovery_inputs() {
+        const auto positions = with_authorization_retry(
+            [&]() { return rest_.get_positions(std::nullopt, 0, gateway::RequestLane::Poll); }
+        );
+        const auto orders = with_authorization_retry(
+            [&]() { return rest_.get_orders(std::nullopt, 0, gateway::RequestLane::Poll); }
+        );
+
+        std::map<std::string, gateway::OrderSnapshot> snapshots;
+        merge_order_snapshots(snapshots, orders);
+        return {
+            positions,
+            snapshots.empty() ? std::optional<std::map<std::string, gateway::OrderSnapshot>>(std::nullopt)
+                              : std::optional<std::map<std::string, gateway::OrderSnapshot>>(snapshots),
+        };
+    }
+
+    [[nodiscard]] ReconcileFetchResult collect_reconcile_inputs(const std::vector<ReconcilePlan>& plans) {
+        ReconcileFetchResult result;
+        bool poll_positions = false;
+        std::set<std::string> order_ids;
+        for (const auto& plan : plans) {
+            poll_positions = poll_positions || plan.poll_positions;
+            order_ids.insert(plan.order_ids.begin(), plan.order_ids.end());
+        }
+
+        if (poll_positions) {
+            result.positions = with_authorization_retry(
+                [&]() { return rest_.get_positions(std::nullopt, 0, gateway::RequestLane::Poll); }
+            );
+        }
+        if (!order_ids.empty()) {
+            result.order_snapshots = collect_active_order_snapshots(std::vector<std::string>(order_ids.begin(), order_ids.end()));
+        }
+        return result;
     }
 
     [[nodiscard]] nlohmann::json status_snapshot() {
@@ -362,6 +412,8 @@ class MicroEdgeApp {
             {"kill_switch_reason", kill_switch_reason_},
             {"kill_switch_hard_close", kill_switch_hard_close_},
             {"symbol_count", strategy_runtimes_.size()},
+            {"recovery_in_progress", recovery_in_progress_},
+            {"recovery_reason", recovery_reason_},
             {"websocket", websocket_status_provider_ ? websocket_status_provider_() : nlohmann::json{{"status", "unconfigured"}}},
             {"market_data", market_data},
             {"token_refresh_count", token_refresh_count_},
@@ -385,6 +437,23 @@ class MicroEdgeApp {
     [[nodiscard]] bool kill_switch_hard_close() const { return kill_switch_hard_close_; }
 
   private:
+    static void merge_order_snapshots(
+        std::map<std::string, gateway::OrderSnapshot>& snapshots,
+        const std::vector<nlohmann::json>& raws,
+        const std::set<std::string>& requested_ids = {}
+    ) {
+        for (const auto& raw : raws) {
+            const auto snapshot = gateway::KabuAdapter::order_snapshot(raw);
+            if (!snapshot.has_value()) {
+                continue;
+            }
+            if (!requested_ids.empty() && !requested_ids.contains(snapshot->order_id)) {
+                continue;
+            }
+            snapshots[snapshot->order_id] = *snapshot;
+        }
+    }
+
     [[nodiscard]] static std::int64_t wall_clock_ns() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::system_clock::now().time_since_epoch()
@@ -458,6 +527,8 @@ class MicroEdgeApp {
     std::string last_websocket_error_;
     int reconcile_failure_count_{0};
     std::string last_reconcile_error_;
+    bool recovery_in_progress_{false};
+    std::string recovery_reason_;
 };
 
 }  // namespace kabu::app

@@ -381,6 +381,9 @@ class ExecutionController {
         }
 
         auto& order = **slot;
+        if (snapshot.cum_qty < order.cum_qty) {
+            return;
+        }
         const int new_qty = std::max(snapshot.cum_qty - order.cum_qty, 0);
         if (new_qty > 0) {
             if (order.fill_reason.empty()) {
@@ -658,11 +661,13 @@ class ExecutionController {
         slot->cancel_requested = true;
         paper_last_fill_reason = reason;
         ++stats["cancel_orders"];
+        order_ledger_.mark_cancel_pending(slot->order_id, reason);
         if (dry_run) {
             finalize_order(entry_side, "cancelled");
         } else {
             if (!cancel_order_sender_) {
                 slot->cancel_requested = false;
+                order_ledger_.mark_working(slot->order_id);
                 throw std::runtime_error("live cancel order sender has not been configured");
             }
             try {
@@ -671,6 +676,7 @@ class ExecutionController {
                 const auto code = extract_error_code(error.payload());
                 if (!(error.status() == 500 && code.has_value() && *code == 43)) {
                     slot->cancel_requested = false;
+                    order_ledger_.mark_working(slot->order_id);
                     throw;
                 }
             }

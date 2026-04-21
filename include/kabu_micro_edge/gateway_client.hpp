@@ -999,7 +999,7 @@ inline void KabuWebSocket::run_connected_loop(bool reconnect) {
     }
     reset_stream_state();
     note_connect(reconnect);
-    if (on_reconnect_) {
+    if (reconnect && on_reconnect_) {
         try {
             on_reconnect_();
         } catch (const std::exception& error) {

@@ -70,54 +70,57 @@ void configure_live_execution(
 ) {
     strategy.execution().set_live_order_callbacks(
         [&app, symbol, &config](int side, int qty, double price, bool is_market) {
-            const auto response =
-                app.rest().send_entry_order(symbol.symbol, symbol.exchange, side, qty, price, is_market, config.order_profile);
+            const auto response = app.with_authorization_retry([&]() {
+                return app.rest().send_entry_order(
+                    symbol.symbol,
+                    symbol.exchange,
+                    side,
+                    qty,
+                    price,
+                    is_market,
+                    config.order_profile
+                );
+            });
             return kabu::gateway::parse_string(
                 response.contains("OrderId") ? response.at("OrderId") : response.value("ID", nlohmann::json()),
                 std::string()
             );
         },
         [&app, symbol, &config](int position_side, int qty, double price, bool is_market) {
-            const auto response = app.rest().send_exit_order(
-                symbol.symbol,
-                symbol.exchange,
-                position_side,
-                qty,
-                price,
-                is_market,
-                config.order_profile
-            );
+            const auto response = app.with_authorization_retry([&]() {
+                return app.rest().send_exit_order(
+                    symbol.symbol,
+                    symbol.exchange,
+                    position_side,
+                    qty,
+                    price,
+                    is_market,
+                    config.order_profile
+                );
+            });
             return kabu::gateway::parse_string(
                 response.contains("OrderId") ? response.at("OrderId") : response.value("ID", nlohmann::json()),
                 std::string()
             );
         },
-        [&app](const std::string& order_id) { app.rest().cancel_order(order_id); }
+        [&app](const std::string& order_id) {
+            app.with_authorization_retry([&]() {
+                app.rest().cancel_order(order_id);
+            });
+        }
     );
 }
 
 void reconcile_startup_state(kabu::app::MicroEdgeApp& app) {
-    const auto positions = app.with_authorization_retry(
-        [&]() { return app.rest().get_positions(std::nullopt, 0, kabu::gateway::RequestLane::Poll); }
-    );
-    const auto orders = app.with_authorization_retry(
-        [&]() { return app.rest().get_orders(std::nullopt, 0, kabu::gateway::RequestLane::Poll); }
-    );
-    std::map<std::string, kabu::gateway::OrderSnapshot> order_snapshots;
-    for (const auto& raw : orders) {
-        const auto snapshot = kabu::gateway::KabuAdapter::order_snapshot(raw);
-        if (snapshot.has_value() && !snapshot->order_id.empty()) {
-            order_snapshots[snapshot->order_id] = *snapshot;
-        }
-    }
-
+    const auto snapshot = app.collect_startup_recovery_inputs();
     const auto timestamp_ns = now_ns();
     for (auto& [_, runtime] : app.strategy_runtimes()) {
-        runtime.strategy->reconcile_with_prefetched(positions, order_snapshots, timestamp_ns);
+        runtime.strategy->reconcile_with_prefetched(snapshot.positions, snapshot.order_snapshots, timestamp_ns);
         runtime.next_reconcile_at_monotonic = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() +
                                               app.build_reconcile_plan(*runtime.strategy).sleep_s;
     }
     app.note_reconcile_success();
+    app.set_recovery_state(false);
 }
 
 void run_reconcile_cycle(kabu::app::MicroEdgeApp& app) {
@@ -136,53 +139,31 @@ void run_reconcile_cycle(kabu::app::MicroEdgeApp& app) {
         return;
     }
 
-    std::vector<nlohmann::json> positions;
     try {
-        positions = app.with_authorization_retry(
-            [&]() { return app.rest().get_positions(std::nullopt, 0, kabu::gateway::RequestLane::Poll); }
-        );
-    } catch (const std::exception& error) {
-        app.note_reconcile_failure(error.what());
-        return;
-    }
+        const std::vector<kabu::app::ReconcilePlan> plans = [&]() {
+            std::vector<kabu::app::ReconcilePlan> values;
+            values.reserve(due.size());
+            for (const auto& [_, plan] : due) {
+                values.push_back(plan);
+            }
+            return values;
+        }();
 
-    std::set<std::string> order_ids;
-    for (const auto& [key, plan] : due) {
-        (void)key;
-        order_ids.insert(plan.order_ids.begin(), plan.order_ids.end());
-    }
-
-    std::map<std::string, kabu::gateway::OrderSnapshot> order_snapshots;
-    try {
-        const auto all_orders = app.with_authorization_retry(
-            [&]() { return app.rest().get_orders(std::nullopt, 0, kabu::gateway::RequestLane::Poll); }
-        );
-        for (const auto& raw : all_orders) {
-            const auto snapshot = kabu::gateway::KabuAdapter::order_snapshot(raw);
-            if (!snapshot.has_value() || snapshot->order_id.empty()) {
+        const auto snapshot = app.collect_reconcile_inputs(plans);
+        const auto timestamp_ns = now_ns();
+        for (const auto& [key, plan] : due) {
+            auto it = runtimes.find(key);
+            if (it == runtimes.end()) {
                 continue;
             }
-            if (order_ids.empty() || order_ids.contains(snapshot->order_id) ||
-                (!snapshot->symbol.empty() &&
-                 runtimes.contains({snapshot->symbol, snapshot->exchange}))) {
-                order_snapshots[snapshot->order_id] = *snapshot;
-            }
+            it->second.strategy->reconcile_with_prefetched(snapshot.positions, snapshot.order_snapshots, timestamp_ns);
+            it->second.next_reconcile_at_monotonic = loop_now_s + plan.sleep_s;
         }
+        app.note_reconcile_success();
     } catch (const std::exception& error) {
         app.note_reconcile_failure(error.what());
         return;
     }
-
-    const auto timestamp_ns = now_ns();
-    for (const auto& [key, plan] : due) {
-        auto it = runtimes.find(key);
-        if (it == runtimes.end()) {
-            continue;
-        }
-        it->second.strategy->reconcile_with_prefetched(positions, order_snapshots, timestamp_ns);
-        it->second.next_reconcile_at_monotonic = loop_now_s + plan.sleep_s;
-    }
-    app.note_reconcile_success();
 }
 
 }  // namespace
@@ -272,7 +253,8 @@ int main(int argc, char** argv) {
         }
 
         std::unique_ptr<kabu::gateway::KabuWebSocket> websocket;
-        bool received_market_data = false;
+        kabu::gateway::KabuWebSocket* websocket_handle = nullptr;
+        std::atomic_bool received_market_data{false};
         std::string last_ws_error;
 
         if (!config.dry_run) {
@@ -288,6 +270,7 @@ int main(int argc, char** argv) {
                 }
             }
 
+            app.set_recovery_state(true, "startup_recovery");
             app.startup_with_retry([](double delay_s) {
                 std::this_thread::sleep_for(std::chrono::duration<double>(delay_s));
             });
@@ -296,19 +279,24 @@ int main(int argc, char** argv) {
             websocket = std::make_unique<kabu::gateway::KabuWebSocket>(
                 config.ws_url,
                 [&](const kabu::gateway::BoardSnapshot& snapshot) {
-                    received_market_data = true;
+                    received_market_data.store(true, std::memory_order_relaxed);
                     app.on_board(snapshot);
                 },
                 [&](const kabu::gateway::TradePrint& trade) {
-                    received_market_data = true;
+                    received_market_data.store(true, std::memory_order_relaxed);
                     app.on_trade(trade);
                 },
                 [&]() {
+                    app.set_recovery_state(true, "websocket_reconnect_recovery");
                     app.reregister_symbols();
+                    if (websocket_handle != nullptr) {
+                        websocket_handle->set_api_token(app.rest().token());
+                    }
                     reconcile_startup_state(app);
                 },
                 app.rest().token()
             );
+            websocket_handle = websocket.get();
             app.set_websocket_status_provider([&websocket]() {
                 return websocket ? websocket->snapshot_json()
                                  : nlohmann::json{{"status", "stopped"}, {"running", false}, {"connected", false}, {"stopped", true}};
@@ -348,7 +336,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (health_check && received_market_data) {
+            if (health_check && received_market_data.load(std::memory_order_relaxed)) {
                 break;
             }
 
@@ -384,7 +372,7 @@ int main(int argc, char** argv) {
         app.set_running(false);
 
         std::cout << std::setw(2) << build_payload(config, app, true, false) << "\n";
-        if (health_check && !received_market_data) {
+        if (health_check && !received_market_data.load(std::memory_order_relaxed)) {
             std::cerr << "Health check failed: connected startup completed but no market data was observed.\n";
             return 3;
         }

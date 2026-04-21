@@ -24,6 +24,22 @@ namespace kabu::strategy {
 class MicroEdgeStrategy {
   public:
     using EntryGuard = std::function<std::pair<bool, std::string>(int, double)>;
+    struct RuntimeMetrics {
+        int queue_depth{0};
+        int queue_maxsize{0};
+        int max_queue_depth{0};
+        int events_enqueued{0};
+        int events_processed{0};
+        int event_backlog{0};
+        bool event_worker_running{false};
+        bool event_worker_busy{false};
+        double last_queue_wait_ms{0.0};
+        double queue_wait_p95_ms{0.0};
+        double queue_wait_p99_ms{0.0};
+        double last_process_ms{0.0};
+        double process_p95_ms{0.0};
+        double process_p99_ms{0.0};
+    };
 
     MicroEdgeStrategy(
         config::SymbolConfig symbol,
@@ -121,7 +137,7 @@ class MicroEdgeStrategy {
     }
 
     void reconcile_with_prefetched(
-        const std::vector<nlohmann::json>& positions,
+        const std::optional<std::vector<nlohmann::json>>& positions = std::nullopt,
         const std::optional<std::map<std::string, gateway::OrderSnapshot>>& order_snapshots_by_id = std::nullopt,
         std::int64_t now_ns = 0
     ) {
@@ -142,8 +158,8 @@ class MicroEdgeStrategy {
                 }
             }
         }
-        if (!dry_run_) {
-            execution_.sync_broker_position_snapshot(positions, true);
+        if (!dry_run_ && positions.has_value()) {
+            execution_.sync_broker_position_snapshot(*positions, true);
         }
         post_execution_update(reconcile_now_ns);
         enforce_kill_switch(reconcile_now_ns);
@@ -166,6 +182,24 @@ class MicroEdgeStrategy {
     [[nodiscard]] const risk::RiskController& risk() const { return risk_; }
     [[nodiscard]] const config::SymbolConfig& symbol_config() const { return symbol_config_; }
     [[nodiscard]] const std::optional<gateway::BoardSnapshot>& latest_board() const { return latest_board_; }
+    [[nodiscard]] RuntimeMetrics runtime_metrics() const {
+        return {
+            0,
+            event_queue_maxsize_,
+            max_queue_depth_,
+            events_enqueued_,
+            events_processed_,
+            std::max(events_enqueued_ - events_processed_, 0),
+            started_,
+            false,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        };
+    }
 
     [[nodiscard]] nlohmann::json status() {
         const auto risk_snapshot = risk_.snapshot(latest_signal_.has_value() ? latest_signal_->ts_ns : 0);
@@ -187,6 +221,7 @@ class MicroEdgeStrategy {
         execution_json["last_entry_score"] = last_entry_score_;
         execution_json["scale_in_count"] = round_scale_in_count_;
 
+        const auto runtime = runtime_metrics();
         return {
             {"symbol", symbol_config_.symbol},
             {"state", execution::to_string(execution_.state())},
@@ -223,26 +258,26 @@ class MicroEdgeStrategy {
             {"execution", execution_json},
             {"runtime",
              {
-                 {"queue_depth", 0},
-                 {"queue_maxsize", event_queue_maxsize_},
-                 {"max_queue_depth", max_queue_depth_},
-                 {"events_enqueued", events_enqueued_},
-                 {"events_processed", events_processed_},
-                 {"event_backlog", std::max(events_enqueued_ - events_processed_, 0)},
+                 {"queue_depth", runtime.queue_depth},
+                 {"queue_maxsize", runtime.queue_maxsize},
+                 {"max_queue_depth", runtime.max_queue_depth},
+                 {"events_enqueued", runtime.events_enqueued},
+                 {"events_processed", runtime.events_processed},
+                 {"event_backlog", runtime.event_backlog},
                  {"queue_overflow_count", 0},
                  {"dropped_board_events", 0},
                  {"dropped_trade_events", 0},
                  {"deferred_board_pending", false},
                  {"last_queue_drop_kind", ""},
-                 {"event_worker_running", started_},
-                 {"event_worker_busy", false},
+                 {"event_worker_running", runtime.event_worker_running},
+                 {"event_worker_busy", runtime.event_worker_busy},
                  {"last_event_kind", last_event_kind_},
-                 {"last_queue_wait_ms", 0.0},
-                 {"queue_wait_p95_ms", 0.0},
-                 {"queue_wait_p99_ms", 0.0},
-                 {"last_process_ms", 0.0},
-                 {"process_p95_ms", 0.0},
-                 {"process_p99_ms", 0.0},
+                 {"last_queue_wait_ms", runtime.last_queue_wait_ms},
+                 {"queue_wait_p95_ms", runtime.queue_wait_p95_ms},
+                 {"queue_wait_p99_ms", runtime.queue_wait_p99_ms},
+                 {"last_process_ms", runtime.last_process_ms},
+                 {"process_p95_ms", runtime.process_p95_ms},
+                 {"process_p99_ms", runtime.process_p99_ms},
              }},
             {"analytics",
              {
