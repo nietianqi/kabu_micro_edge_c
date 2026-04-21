@@ -863,7 +863,10 @@ class ExecutionController {
             inventory.avg_price = new_qty > 0 ? ((inventory.avg_price * prev_qty) + (fill_price * qty)) / new_qty : 0.0;
             inventory.qty = new_qty;
             inventory.side = order.side;
-            inventory.opened_ts_ns = fill_ts_ns;
+            if (prev_qty <= 0 || inventory.opened_ts_ns <= 0) {
+                inventory.opened_ts_ns = fill_ts_ns;
+            }
+            inventory.last_entry_fill_ts_ns = fill_ts_ns;
             inventory.entry_qty += qty;
             update_inventory_entry_metadata(order);
             return;

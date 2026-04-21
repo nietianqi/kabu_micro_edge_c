@@ -389,3 +389,59 @@ TEST(ExecutionTest, ConsistencyIssuesDetectUnflaggedInventoryBrokerMismatch) {
     ASSERT_EQ(snapshot.at("consistency_issues").size(), 1U);
     EXPECT_EQ(snapshot.at("consistency_issues")[0].at("code").get<std::string>(), "inventory_broker_mismatch_unflagged");
 }
+
+TEST(ExecutionTest, ScaleInPreservesOriginalOpenedTimestamp) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    int entry_sends = 0;
+    controller.set_live_order_callbacks(
+        [&](int, int, double, bool) {
+            ++entry_sends;
+            return "OID-ENTRY-" + std::to_string(entry_sends);
+        },
+        [&](int, int, double, bool) { return std::string("OID-EXIT-1"); },
+        [&](const std::string&) {}
+    );
+
+    const auto first_fill_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    const auto second_fill_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:02+09:00");
+
+    ASSERT_TRUE(controller.open_explicit(1, 100, 1734.0, make_board(1734.0, 1734.5), "test", false, "maker", 3));
+
+    kabu::gateway::OrderSnapshot first_fill;
+    first_fill.order_id = "OID-ENTRY-1";
+    first_fill.side = 1;
+    first_fill.order_qty = 100;
+    first_fill.cum_qty = 100;
+    first_fill.price = 1734.0;
+    first_fill.avg_fill_price = 1734.0;
+    first_fill.is_final = true;
+    first_fill.state_code = 5;
+    first_fill.order_state_code = 5;
+    first_fill.fill_ts_ns = first_fill_ts;
+    controller.apply_broker_snapshot(first_fill);
+
+    ASSERT_TRUE(controller.open_explicit(1, 100, 1734.0, make_board(1734.0, 1734.5), "test", false, "maker", 3));
+
+    auto second_fill = first_fill;
+    second_fill.order_id = "OID-ENTRY-2";
+    second_fill.fill_ts_ns = second_fill_ts;
+    controller.apply_broker_snapshot(second_fill);
+
+    EXPECT_EQ(controller.inventory.qty, 200);
+    EXPECT_EQ(controller.inventory.opened_ts_ns, first_fill_ts);
+    EXPECT_EQ(controller.inventory.last_entry_fill_ts_ns, second_fill_ts);
+}

@@ -69,6 +69,7 @@ struct Inventory {
     int qty{0};
     double avg_price{0.0};
     std::int64_t opened_ts_ns{0};
+    std::int64_t last_entry_fill_ts_ns{0};
     int entry_qty{0};
     int exit_qty{0};
     double exit_value{0.0};

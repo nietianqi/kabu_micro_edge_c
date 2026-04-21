@@ -232,6 +232,33 @@ TEST(RuntimeTest, FileKillSwitchRequestActivatesSoftStop) {
     EXPECT_FALSE(app.kill_switch_hard_close());
 }
 
+TEST(RuntimeTest, MaybePollKillSwitchHonorsConfiguredInterval) {
+    auto config = kabu::config::load_config();
+    auto strategy = make_strategy(config, "7269", 9);
+
+    const auto dir = std::filesystem::temp_directory_path() / "kabu_micro_edge_c_runtime_interval";
+    std::filesystem::create_directories(dir);
+    const auto kill_switch_path = dir / "kill-switch.json";
+    std::filesystem::remove(kill_switch_path);
+
+    config.kill_switch_path = kill_switch_path.string();
+    config.kill_switch_poll_interval_ms = 250;
+    kabu::app::MicroEdgeApp app(config);
+    app.set_strategy(strategy);
+
+    EXPECT_FALSE(app.maybe_poll_kill_switch(1.0));
+
+    std::ofstream out(kill_switch_path);
+    out << R"({"active": true, "mode": "soft", "reason": "ops_soft_stop"})";
+    out.close();
+
+    EXPECT_FALSE(app.maybe_poll_kill_switch(1.1));
+    EXPECT_FALSE(app.kill_switch_active());
+    EXPECT_TRUE(app.maybe_poll_kill_switch(1.3));
+    EXPECT_TRUE(app.kill_switch_active());
+    EXPECT_EQ(app.kill_switch_reason(), "ops_soft_stop");
+}
+
 TEST(RuntimeTest, BuildRegisterPayloadUsesRegisterExchangeNormalization) {
     auto config = kabu::config::load_config();
     config.symbols.clear();
@@ -422,6 +449,31 @@ TEST(RuntimeTest, CollectReconcileInputsFetchesTargetedOrdersWithoutPositions) {
     EXPECT_EQ(snapshot.order_snapshots->at("OID-1").cum_qty, 10);
     EXPECT_EQ(positions_calls, 0);
     EXPECT_EQ(order_calls, 1);
+}
+
+TEST(RuntimeTest, CollectReconcileInputsPropagatesOrderPollFailure) {
+    auto config = kabu::config::load_config();
+    kabu::app::MicroEdgeApp app(config);
+
+    app.set_rest_request_executor(
+        [&](const std::string&,
+            const std::string& url,
+            const nlohmann::json&,
+            const nlohmann::json&,
+            bool,
+            kabu::gateway::RequestLane) -> kabu::gateway::TransportResponse {
+            if (url.ends_with("/kabusapi/orders")) {
+                return {503, nlohmann::json{{"Code", 503}, {"Message", "temporary failure"}}};
+            }
+            return {404, nlohmann::json::object()};
+        }
+    );
+
+    EXPECT_THROW(
+        (void)app.collect_reconcile_inputs({kabu::app::ReconcilePlan{"orders", 0.5, false, {"OID-1"}}}),
+        kabu::gateway::KabuApiError
+    );
+    EXPECT_FALSE(app.status_snapshot().at("last_rest_error").get<std::string>().empty());
 }
 
 TEST(RuntimeTest, CollectStartupRecoveryInputsFetchesFullBrokerState) {
