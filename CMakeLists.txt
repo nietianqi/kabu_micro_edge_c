@@ -104,5 +104,5 @@ if(BUILD_TESTING)
   target_compile_definitions(kabu_micro_edge_tests PRIVATE KABU_MICRO_EDGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
   include(GoogleTest)
-  gtest_discover_tests(kabu_micro_edge_tests)
+  gtest_discover_tests(kabu_micro_edge_tests DISCOVERY_MODE PRE_TEST)
 endif()

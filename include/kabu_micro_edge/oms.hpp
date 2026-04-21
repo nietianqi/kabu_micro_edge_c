@@ -1,10 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -55,6 +57,10 @@ struct WorkingOrderRecord {
     OrderStatus status{OrderStatus::NewPending};
     int cum_qty{0};
     double avg_fill_price{0.0};
+    OrderStatus broker_status{OrderStatus::Unknown};
+    int broker_cum_qty{0};
+    double broker_avg_fill_price{0.0};
+    bool broker_final{false};
     std::string cancel_reason;
     std::map<std::string, std::string> tags;
 
@@ -63,6 +69,38 @@ struct WorkingOrderRecord {
         return status == OrderStatus::Filled || status == OrderStatus::Canceled || status == OrderStatus::Rejected;
     }
 };
+
+enum class BrokerSnapshotDisposition {
+    Applied,
+    Duplicate,
+    Stale,
+    FinalRepeat,
+    UnknownOrder,
+};
+
+struct BrokerSnapshotUpdate {
+    BrokerSnapshotDisposition disposition{BrokerSnapshotDisposition::UnknownOrder};
+    OrderStatus broker_status{OrderStatus::Unknown};
+    int broker_cum_qty{0};
+    bool broker_final{false};
+};
+
+inline OrderStatus broker_order_status(const kabu::gateway::OrderSnapshot& snapshot) {
+    const std::string status = snapshot.status();
+    if (status == "filled") {
+        return OrderStatus::Filled;
+    }
+    if (status == "cancelled") {
+        return OrderStatus::Canceled;
+    }
+    if (status == "partial") {
+        return OrderStatus::PartiallyFilled;
+    }
+    if (status == "working") {
+        return OrderStatus::Working;
+    }
+    return OrderStatus::Unknown;
+}
 
 class OrderLedger {
   public:
@@ -74,6 +112,11 @@ class OrderLedger {
     }
 
     [[nodiscard]] WorkingOrderRecord* get(const std::string& order_id) {
+        auto it = records_.find(order_id);
+        return it == records_.end() ? nullptr : &it->second;
+    }
+
+    [[nodiscard]] const WorkingOrderRecord* get(const std::string& order_id) const {
         auto it = records_.find(order_id);
         return it == records_.end() ? nullptr : &it->second;
     }
@@ -137,6 +180,48 @@ class OrderLedger {
         }
     }
 
+    [[nodiscard]] BrokerSnapshotUpdate observe_broker_snapshot(
+        const std::string& order_id,
+        const kabu::gateway::OrderSnapshot& snapshot
+    ) {
+        auto* record = get(order_id);
+        if (record == nullptr) {
+            return {};
+        }
+
+        const auto next_status = broker_order_status(snapshot);
+        if (snapshot.cum_qty < record->broker_cum_qty) {
+            return {BrokerSnapshotDisposition::Stale, record->broker_status, record->broker_cum_qty, record->broker_final};
+        }
+
+        const bool same_fill_price = std::abs(record->broker_avg_fill_price - snapshot.avg_fill_price) <= 1e-9;
+        const bool same_progress = snapshot.cum_qty == record->broker_cum_qty && next_status == record->broker_status &&
+                                   snapshot.is_final == record->broker_final && same_fill_price;
+        if (same_progress) {
+            return {
+                record->broker_final ? BrokerSnapshotDisposition::FinalRepeat : BrokerSnapshotDisposition::Duplicate,
+                record->broker_status,
+                record->broker_cum_qty,
+                record->broker_final,
+            };
+        }
+
+        record->broker_status = next_status;
+        record->broker_cum_qty = snapshot.cum_qty;
+        record->broker_avg_fill_price = snapshot.avg_fill_price;
+        record->broker_final = snapshot.is_final;
+        return {BrokerSnapshotDisposition::Applied, record->broker_status, record->broker_cum_qty, record->broker_final};
+    }
+
+    [[nodiscard]] std::vector<WorkingOrderRecord> records() const {
+        std::vector<WorkingOrderRecord> values;
+        values.reserve(records_.size());
+        for (const auto& [_, record] : records_) {
+            values.push_back(record);
+        }
+        return values;
+    }
+
     [[nodiscard]] nlohmann::json snapshot() const {
         nlohmann::json json = nlohmann::json::object();
         for (const auto& [order_id, record] : records_) {
@@ -148,6 +233,10 @@ class OrderLedger {
                 {"status", to_string(record.status)},
                 {"cum_qty", record.cum_qty},
                 {"avg_fill_price", record.avg_fill_price},
+                {"broker_status", to_string(record.broker_status)},
+                {"broker_cum_qty", record.broker_cum_qty},
+                {"broker_avg_fill_price", record.broker_avg_fill_price},
+                {"broker_final", record.broker_final},
                 {"cancel_reason", record.cancel_reason},
                 {"tags", record.tags},
             };
@@ -229,6 +318,10 @@ inline std::pair<WorkingOrderRecord, std::optional<ReconciliationIssue>> reconci
 ) {
     std::optional<ReconciliationIssue> issue;
     const std::string broker_status = broker.status();
+    local.broker_status = broker_order_status(broker);
+    local.broker_cum_qty = broker.cum_qty;
+    local.broker_avg_fill_price = broker.avg_fill_price;
+    local.broker_final = broker.is_final;
     if (!local.is_final()) {
         if (broker_status == "filled") {
             local.status = OrderStatus::Filled;
@@ -247,6 +340,24 @@ inline std::pair<WorkingOrderRecord, std::optional<ReconciliationIssue>> reconci
             broker_status,
             "high",
             "broker cum_qty is behind local cum_qty",
+        };
+    }
+    if (local.status == OrderStatus::Canceled && local.broker_status == OrderStatus::Filled) {
+        issue = ReconciliationIssue{
+            local.order_id,
+            to_string(local.status),
+            broker_status,
+            "high",
+            "broker reports a filled order that local state marked as canceled",
+        };
+    }
+    if (local.status == OrderStatus::Filled && local.broker_status == OrderStatus::Canceled) {
+        issue = ReconciliationIssue{
+            local.order_id,
+            to_string(local.status),
+            broker_status,
+            "high",
+            "broker reports a canceled order that local state marked as filled",
         };
     }
     if (broker.cum_qty > local.cum_qty) {
