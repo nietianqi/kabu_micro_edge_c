@@ -48,6 +48,22 @@ inline int parse_int(const nlohmann::json& value, int default_value = 0) {
     return default_value;
 }
 
+inline std::string parse_string(const nlohmann::json& value, const std::string& default_value = {}) {
+    if (value.is_null()) {
+        return default_value;
+    }
+    try {
+        if (value.is_string()) {
+            return value.get<std::string>();
+        }
+        if (value.is_boolean() || value.is_number()) {
+            return value.dump();
+        }
+    } catch (...) {
+    }
+    return default_value;
+}
+
 inline std::int64_t to_ns(const nlohmann::json& value) {
     if (!value.is_string()) {
         return 0;
@@ -121,6 +137,8 @@ struct TradePrint {
 
 struct OrderSnapshot {
     std::string order_id;
+    std::string symbol;
+    int exchange{1};
     int side{0};
     int order_qty{0};
     int cum_qty{0};
@@ -290,6 +308,19 @@ inline void from_json(const nlohmann::json& json, TradePrint& value) {
     value.size = json.at("size").get<int>();
     value.side = json.at("side").get<int>();
     value.cumulative_volume = json.at("cumulative_volume").get<int>();
+}
+
+inline void to_json(nlohmann::json& json, const PositionLot& value) {
+    json = {
+        {"hold_id", value.hold_id},
+        {"symbol", value.symbol},
+        {"exchange", value.exchange},
+        {"side", value.side},
+        {"qty", value.qty},
+        {"closable_qty", value.closable_qty},
+        {"price", value.price},
+        {"margin_trade_type", value.margin_trade_type},
+    };
 }
 
 }  // namespace kabu::gateway

@@ -120,6 +120,39 @@ class MicroEdgeStrategy {
         enforce_kill_switch(now_ns);
     }
 
+    void reconcile_with_prefetched(
+        const std::vector<nlohmann::json>& positions,
+        const std::optional<std::map<std::string, gateway::OrderSnapshot>>& order_snapshots_by_id = std::nullopt,
+        std::int64_t now_ns = 0
+    ) {
+        if (!started_) {
+            return;
+        }
+        const auto reconcile_now_ns = now_ns > 0 ? now_ns : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                               std::chrono::system_clock::now().time_since_epoch()
+                                                           )
+                                                               .count();
+
+        if (order_snapshots_by_id.has_value()) {
+            execution_.sync_external_order_snapshots(*order_snapshots_by_id);
+            for (const auto& order_id : execution_.active_order_ids()) {
+                const auto it = order_snapshots_by_id->find(order_id);
+                if (it != order_snapshots_by_id->end()) {
+                    execution_.apply_broker_snapshot(it->second);
+                }
+            }
+        }
+        if (!dry_run_) {
+            execution_.sync_broker_position_snapshot(positions, true);
+        }
+        post_execution_update(reconcile_now_ns);
+        enforce_kill_switch(reconcile_now_ns);
+        if (latest_board_.has_value() && latest_signal_.has_value()) {
+            handle_exit(reconcile_now_ns);
+            submit_delayed_tp(reconcile_now_ns);
+        }
+    }
+
     void activate_kill_switch(const std::string& reason, bool hard_close = true) {
         kill_switch_active_ = true;
         kill_switch_reason_ = reason.empty() ? "manual_kill_switch" : reason;

@@ -95,12 +95,18 @@ class MicroEdgeApp {
     }
 
     void on_board(const gateway::BoardSnapshot& snapshot) {
+        last_market_event_receive_ts_ns_ = wall_clock_ns();
+        last_market_data_ts_ns_ = std::max(last_market_data_ts_ns_, snapshot.ts_ns);
+        symbol_last_board_ts_ns_[snapshot.symbol + ":" + std::to_string(snapshot.exchange)] = snapshot.ts_ns;
         if (auto* runtime = resolve_runtime(snapshot.symbol, snapshot.exchange); runtime != nullptr) {
             runtime->strategy->on_board(snapshot);
         }
     }
 
     void on_trade(const gateway::TradePrint& trade) {
+        last_market_event_receive_ts_ns_ = wall_clock_ns();
+        last_market_data_ts_ns_ = std::max(last_market_data_ts_ns_, trade.ts_ns);
+        symbol_last_trade_ts_ns_[trade.symbol + ":" + std::to_string(trade.exchange)] = trade.ts_ns;
         if (auto* runtime = resolve_runtime(trade.symbol, trade.exchange); runtime != nullptr) {
             runtime->strategy->on_trade(trade);
         }
@@ -135,7 +141,9 @@ class MicroEdgeApp {
     }
 
     nlohmann::json register_symbols() {
-        return rest_.register_symbols(build_register_payload());
+        const auto response = rest_.register_symbols(build_register_payload());
+        last_register_success_ts_ns_ = wall_clock_ns();
+        return response;
     }
 
     void startup_with_retry(const std::function<void(double)>& sleeper = {}) {
@@ -159,6 +167,7 @@ class MicroEdgeApp {
                 register_symbols();
                 break;
             } catch (...) {
+                note_rest_error("startup register_symbols failed");
                 if (attempt >= max_retries) {
                     throw;
                 }
@@ -174,12 +183,42 @@ class MicroEdgeApp {
             register_symbols();
         } catch (const gateway::KabuApiError& error) {
             if (error.status() != 401 && error.status() != 403) {
+                note_rest_error(error.what());
                 throw;
             }
             rest_.get_token(config_.api_password);
+            ++token_refresh_count_;
             register_symbols();
         }
     }
+
+    template <typename Fn>
+    decltype(auto) with_authorization_retry(Fn&& fn) {
+        try {
+            return fn();
+        } catch (const gateway::KabuApiError& error) {
+            if (error.status() != 401 && error.status() != 403) {
+                note_rest_error(error.what());
+                throw;
+            }
+            rest_.get_token(config_.api_password);
+            ++token_refresh_count_;
+            register_symbols();
+            return fn();
+        }
+    }
+
+    void set_websocket_status_provider(std::function<nlohmann::json()> provider) {
+        websocket_status_provider_ = std::move(provider);
+    }
+
+    void note_rest_error(std::string message) { last_rest_error_ = std::move(message); }
+    void note_websocket_error(std::string message) { last_websocket_error_ = std::move(message); }
+    void note_reconcile_failure(std::string message) {
+        ++reconcile_failure_count_;
+        last_reconcile_error_ = std::move(message);
+    }
+    void note_reconcile_success() { last_reconcile_error_.clear(); }
 
     [[nodiscard]] ReconcilePlan build_reconcile_plan(strategy::MicroEdgeStrategy& strategy_obj) const {
         const auto base_sleep_s = base_reconcile_interval_s();
@@ -289,7 +328,9 @@ class MicroEdgeApp {
         for (const auto& order_id : requested_ids) {
             std::vector<nlohmann::json> raws;
             try {
-                raws = rest_.get_orders(order_id, 0, gateway::RequestLane::Poll);
+                raws = with_authorization_retry(
+                    [&]() { return rest_.get_orders(order_id, 0, gateway::RequestLane::Poll); }
+                );
             } catch (...) {
                 return std::nullopt;
             }
@@ -309,12 +350,26 @@ class MicroEdgeApp {
         for (const auto& [_, runtime] : strategy_runtimes_) {
             strategies.push_back(runtime.strategy->status());
         }
+        nlohmann::json market_data = {
+            {"last_market_data_ts_ns", last_market_data_ts_ns_},
+            {"last_market_event_receive_ts_ns", last_market_event_receive_ts_ns_},
+            {"per_symbol_last_board_ts_ns", symbol_last_board_ts_ns_},
+            {"per_symbol_last_trade_ts_ns", symbol_last_trade_ts_ns_},
+        };
         return {
             {"running", running_},
             {"kill_switch_active", kill_switch_active_},
             {"kill_switch_reason", kill_switch_reason_},
             {"kill_switch_hard_close", kill_switch_hard_close_},
             {"symbol_count", strategy_runtimes_.size()},
+            {"websocket", websocket_status_provider_ ? websocket_status_provider_() : nlohmann::json{{"status", "unconfigured"}}},
+            {"market_data", market_data},
+            {"token_refresh_count", token_refresh_count_},
+            {"last_register_success_ts_ns", last_register_success_ts_ns_},
+            {"last_rest_error", last_rest_error_},
+            {"last_websocket_error", last_websocket_error_},
+            {"reconcile_failure_count", reconcile_failure_count_},
+            {"last_reconcile_error", last_reconcile_error_},
             {"account_risk", account_risk_snapshot()},
             {"strategies", strategies},
         };
@@ -323,12 +378,20 @@ class MicroEdgeApp {
     void set_running(bool running) { running_ = running; }
 
     [[nodiscard]] const config::AppConfig& config() const { return config_; }
+    [[nodiscard]] std::map<std::pair<std::string, int>, StrategyRuntime>& strategy_runtimes() { return strategy_runtimes_; }
     [[nodiscard]] const std::map<std::pair<std::string, int>, StrategyRuntime>& strategy_runtimes() const { return strategy_runtimes_; }
     [[nodiscard]] bool kill_switch_active() const { return kill_switch_active_; }
     [[nodiscard]] const std::string& kill_switch_reason() const { return kill_switch_reason_; }
     [[nodiscard]] bool kill_switch_hard_close() const { return kill_switch_hard_close_; }
 
   private:
+    [[nodiscard]] static std::int64_t wall_clock_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::system_clock::now().time_since_epoch()
+               )
+            .count();
+    }
+
     [[nodiscard]] double base_reconcile_interval_s() const {
         return std::max(config_.reconcile_interval_ms / 1000.0, 0.1);
     }
@@ -380,10 +443,21 @@ class MicroEdgeApp {
     risk::AccountRiskController account_risk_;
     std::map<std::pair<std::string, int>, StrategyRuntime> strategy_runtimes_;
     std::map<std::pair<std::string, int>, std::pair<std::string, int>> strategy_routes_;
+    std::function<nlohmann::json()> websocket_status_provider_;
     bool running_{false};
     bool kill_switch_active_{false};
     std::string kill_switch_reason_;
     bool kill_switch_hard_close_{false};
+    std::int64_t last_market_data_ts_ns_{0};
+    std::int64_t last_market_event_receive_ts_ns_{0};
+    std::map<std::string, std::int64_t> symbol_last_board_ts_ns_;
+    std::map<std::string, std::int64_t> symbol_last_trade_ts_ns_;
+    int token_refresh_count_{0};
+    std::int64_t last_register_success_ts_ns_{0};
+    std::string last_rest_error_;
+    std::string last_websocket_error_;
+    int reconcile_failure_count_{0};
+    std::string last_reconcile_error_;
 };
 
 }  // namespace kabu::app

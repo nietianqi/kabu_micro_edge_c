@@ -16,7 +16,7 @@ inline bool is_fill_detail(const nlohmann::json& detail) {
     if (rec_type == 3 || rec_type == 8) {
         return true;
     }
-    const std::string execution_id = detail.value("ExecutionID", std::string());
+    const std::string execution_id = parse_string(detail.value("ExecutionID", nlohmann::json()), std::string());
     return !execution_id.empty() && execution_id.rfind("E", 0) == 0;
 }
 
@@ -44,7 +44,7 @@ class KabuAdapter {
 
     static std::optional<BoardSnapshot> board(const nlohmann::json& raw, const std::optional<BoardSnapshot>& prev) {
         BoardSnapshot snapshot;
-        snapshot.symbol = raw.value("Symbol", std::string());
+        snapshot.symbol = parse_string(raw.value("Symbol", nlohmann::json()), std::string());
         snapshot.exchange = parse_int(raw.value("Exchange", nlohmann::json()), 1);
         snapshot.bids = parse_levels(raw, "Buy", true);
         snapshot.asks = parse_levels(raw, "Sell", false);
@@ -57,8 +57,8 @@ class KabuAdapter {
         snapshot.bid_size = bid_qty_raw > 0 ? bid_qty_raw : (!snapshot.bids.empty() ? snapshot.bids.front().size : 0);
         const int ask_qty_raw = parse_int(raw.value("BidQty", nlohmann::json()));
         snapshot.ask_size = ask_qty_raw > 0 ? ask_qty_raw : (!snapshot.asks.empty() ? snapshot.asks.front().size : 0);
-        snapshot.bid_sign = raw.value("AskSign", std::string());
-        snapshot.ask_sign = raw.value("BidSign", std::string());
+        snapshot.bid_sign = parse_string(raw.value("AskSign", nlohmann::json()), std::string());
+        snapshot.ask_sign = parse_string(raw.value("BidSign", nlohmann::json()), std::string());
         snapshot.current_ts_ns = to_ns(raw.value("CurrentPriceTime", nlohmann::json()));
         snapshot.bid_ts_ns = to_ns(raw.value("BidTime", nlohmann::json()));
         snapshot.ask_ts_ns = to_ns(raw.value("AskTime", nlohmann::json()));
@@ -80,7 +80,10 @@ class KabuAdapter {
         snapshot.volume = parse_int(raw.value("TradingVolume", nlohmann::json()));
         snapshot.vwap = parse_float(raw.value("VWAP", nlohmann::json()), snapshot.last);
         snapshot.out_of_order = prev.has_value() && snapshot.ts_ns > 0 && prev->ts_ns > 0 && snapshot.ts_ns < prev->ts_ns;
-        snapshot.duplicate = prev.has_value() && !snapshot.out_of_order && snapshot.ts_ns > 0 && snapshot.ts_ns == prev->ts_ns;
+        snapshot.duplicate =
+            prev.has_value() && !snapshot.out_of_order && snapshot.ts_ns > 0 && snapshot.ts_ns == prev->ts_ns &&
+            std::abs(snapshot.bid - prev->bid) <= 1e-9 && std::abs(snapshot.ask - prev->ask) <= 1e-9 &&
+            snapshot.bid_size == prev->bid_size && snapshot.ask_size == prev->ask_size && snapshot.volume == prev->volume;
         return snapshot;
     }
 
@@ -121,7 +124,7 @@ class KabuAdapter {
         }
 
         TradePrint trade;
-        trade.symbol = raw.value("Symbol", std::string());
+        trade.symbol = parse_string(raw.value("Symbol", nlohmann::json()), std::string());
         trade.exchange = parse_int(raw.value("Exchange", nlohmann::json()), 1);
         trade.ts_ns = to_ns(raw.contains("TradingVolumeTime") ? raw.at("TradingVolumeTime") : raw.value("CurrentPriceTime", nlohmann::json()));
         trade.price = price;
@@ -133,11 +136,13 @@ class KabuAdapter {
 
     static std::optional<OrderSnapshot> order_snapshot(const nlohmann::json& raw) {
         OrderSnapshot snapshot;
-        snapshot.order_id = raw.value("ID", raw.value("OrderId", std::string()));
+        snapshot.order_id = parse_string(raw.contains("ID") ? raw.at("ID") : raw.value("OrderId", nlohmann::json()), std::string());
         if (snapshot.order_id.empty()) {
             return std::nullopt;
         }
 
+        snapshot.symbol = parse_string(raw.value("Symbol", nlohmann::json()), std::string());
+        snapshot.exchange = parse_int(raw.value("Exchange", nlohmann::json()), 1);
         snapshot.order_qty = parse_int(raw.contains("OrderQty") ? raw.at("OrderQty") : raw.value("Qty", nlohmann::json()));
         snapshot.cum_qty = parse_int(raw.value("CumQty", nlohmann::json()));
         snapshot.price = parse_float(raw.value("Price", nlohmann::json()));
@@ -180,6 +185,27 @@ class KabuAdapter {
         snapshot.fill_ts_ns = latest_fill_ts_ns;
         snapshot.raw = raw;
         return snapshot;
+    }
+
+    static std::optional<PositionLot> position_lot(const nlohmann::json& raw) {
+        PositionLot lot;
+        lot.hold_id = parse_string(raw.contains("HoldID") ? raw.at("HoldID") : raw.value("ExecutionID", nlohmann::json()), std::string());
+        lot.symbol = parse_string(raw.value("Symbol", nlohmann::json()), std::string());
+        const auto leaves_qty = raw.contains("LeavesQty") ? raw.at("LeavesQty") : nlohmann::json();
+        const auto hold_qty = raw.contains("HoldQty") ? raw.at("HoldQty") : nlohmann::json();
+        lot.qty = parse_int(!leaves_qty.is_null() ? leaves_qty : raw.value("Qty", nlohmann::json()));
+        if (lot.hold_id.empty() || lot.symbol.empty() || lot.qty <= 0) {
+            return std::nullopt;
+        }
+
+        const auto closable_qty = raw.contains("ClosableQty") ? raw.at("ClosableQty") : nlohmann::json();
+        const int locked_qty = parse_int(hold_qty);
+        lot.closable_qty = !closable_qty.is_null() ? parse_int(closable_qty) : std::max(lot.qty - locked_qty, 0);
+        lot.exchange = parse_int(raw.value("Exchange", nlohmann::json()), 1);
+        lot.side = internal_side(raw.value("Side", nlohmann::json()));
+        lot.price = parse_float(raw.contains("Price") ? raw.at("Price") : raw.value("ExecutionPrice", nlohmann::json()));
+        lot.margin_trade_type = parse_int(raw.value("MarginTradeType", nlohmann::json()), 0);
+        return lot;
     }
 };
 

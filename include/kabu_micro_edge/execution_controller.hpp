@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -20,6 +22,9 @@ namespace kabu::execution {
 class ExecutionController {
   public:
     enum class TseTickProfile { Other, Topix100 };
+    using EntryOrderSender = std::function<std::string(int side, int qty, double price, bool is_market)>;
+    using ExitOrderSender = std::function<std::string(int position_side, int qty, double price, bool is_market)>;
+    using CancelOrderSender = std::function<void(const std::string& order_id)>;
 
     ExecutionController(
         std::string symbol,
@@ -72,8 +77,10 @@ class ExecutionController {
     std::int64_t exit_blocked_until_ns{0};
     bool manual_close_lock{false};
     bool has_external_inventory{false};
+    bool has_external_active_orders{false};
     int broker_hold_qty{0};
     int broker_closable_qty{0};
+    std::vector<std::string> broker_active_order_ids;
     std::map<std::string, int> stats;
     RequoteBudget requotes;
 
@@ -114,13 +121,21 @@ class ExecutionController {
     [[nodiscard]] bool has_working_entry() const { return working_order.has_value(); }
     [[nodiscard]] bool has_working_exit() const { return exit_order.has_value(); }
     [[nodiscard]] bool has_working_orders() const { return has_working_entry() || has_working_exit(); }
-    [[nodiscard]] bool has_external_inventory_conflict() const { return has_external_inventory || manual_close_lock; }
+    [[nodiscard]] bool has_external_inventory_conflict() const {
+        return has_external_inventory || manual_close_lock || has_external_active_orders;
+    }
 
     [[nodiscard]] bool can_manage_local_exit() const {
         if (inventory.qty <= 0 || manual_close_lock) {
             return false;
         }
         return !has_external_inventory || broker_closable_qty >= inventory.qty;
+    }
+
+    void set_live_order_callbacks(EntryOrderSender entry_sender, ExitOrderSender exit_sender, CancelOrderSender cancel_sender) {
+        entry_order_sender_ = std::move(entry_sender);
+        exit_order_sender_ = std::move(exit_sender);
+        cancel_order_sender_ = std::move(cancel_sender);
     }
 
     [[nodiscard]] PriceDecision preview_entry(
@@ -167,8 +182,13 @@ class ExecutionController {
         const double order_price = is_market ? 0.0 : align_order_price_to_tse_tick(price, direction, price, snapshot);
         const bool should_fill_immediately = is_market || (direction > 0 && order_price >= snapshot.ask && snapshot.ask > 0) ||
                                              (direction < 0 && order_price <= snapshot.bid && snapshot.bid > 0);
+        const std::string order_id =
+            dry_run ? next_paper_order_id() : request_live_entry_order(direction, qty, order_price, is_market, now_ns);
+        if (order_id.empty()) {
+            return false;
+        }
         working_order = WorkingOrder{
-            next_paper_order_id(), "entry", direction, qty, order_price, is_market, now_ns, reason, mode,
+            order_id, "entry", direction, qty, order_price, is_market, now_ns, reason, mode,
             0, 0.0, false, 0, 0, entry_score, ""
         };
         order_ledger_.add({working_order->order_id, symbol, direction, qty, order_price});
@@ -234,9 +254,13 @@ class ExecutionController {
             return cancel_exit_order("refresh_" + reason);
         }
 
-        exit_order = WorkingOrder{
-            next_paper_order_id(), "exit", -inventory.side, inventory.qty, order_price, is_market, now_ns, reason
-        };
+        const std::string order_id =
+            dry_run ? next_paper_order_id() : request_live_exit_order(inventory.side, inventory.qty, order_price, is_market, now_ns);
+        if (order_id.empty()) {
+            return false;
+        }
+
+        exit_order = WorkingOrder{order_id, "exit", -inventory.side, inventory.qty, order_price, is_market, now_ns, reason};
         order_ledger_.add({exit_order->order_id, symbol, exit_order->side, exit_order->qty, order_price});
         order_ledger_.mark_working(exit_order->order_id);
         ++stats["sent_orders"];
@@ -316,6 +340,7 @@ class ExecutionController {
             {"broker_closable_qty", broker_closable_qty},
             {"manual_close_lock", manual_close_lock},
             {"external_inventory", has_external_inventory},
+            {"external_active_orders", has_external_active_orders},
             {"has_stranded_partial", has_stranded_partial},
             {"entry_blocked_until_ns", entry_blocked_until_ns},
             {"exit_blocked_until_ns", exit_blocked_until_ns},
@@ -335,6 +360,7 @@ class ExecutionController {
             {"inventory_entry_queue_ahead_qty", inventory.entry_queue_ahead_qty},
             {"paper_last_fill_reason", paper_last_fill_reason},
             {"active_order_ids", active_order_ids()},
+            {"broker_active_order_ids", broker_active_order_ids},
             {"stats", stats},
             {"ledger", order_ledger_.snapshot()},
         };
@@ -348,7 +374,197 @@ class ExecutionController {
         return std::max(new_qty * new_avg - prev_qty * prev_avg, 0.0) / incremental_qty;
     }
 
+    void apply_broker_snapshot(const gateway::OrderSnapshot& snapshot) {
+        auto* slot = order_slot(snapshot.order_id);
+        if (slot == nullptr || !slot->has_value()) {
+            return;
+        }
+
+        auto& order = **slot;
+        const int new_qty = std::max(snapshot.cum_qty - order.cum_qty, 0);
+        if (new_qty > 0) {
+            if (order.fill_reason.empty()) {
+                order.fill_reason = "broker_snapshot_fill";
+            }
+            const double fill_price = incremental_fill_price(
+                order.cum_qty,
+                order.avg_fill_price,
+                snapshot.cum_qty,
+                snapshot.avg_fill_price > 0 ? snapshot.avg_fill_price : snapshot.price
+            );
+            const auto fill_ts_ns = snapshot.fill_ts_ns > 0 ? snapshot.fill_ts_ns : wall_clock_ns();
+            apply_fill(order, new_qty, fill_price, fill_ts_ns);
+            order.cum_qty = snapshot.cum_qty;
+            order.avg_fill_price = snapshot.avg_fill_price > 0 ? snapshot.avg_fill_price : fill_price;
+        }
+
+        if (snapshot.is_final) {
+            finalize_order(order.purpose == "entry", snapshot.status());
+        }
+    }
+
+    void sync_broker_position_snapshot(const std::vector<nlohmann::json>& positions, bool force = true) {
+        (void)force;
+        int long_hold = 0;
+        int long_closable = 0;
+        int short_hold = 0;
+        int short_closable = 0;
+        for (const auto& raw : positions) {
+            const auto lot = gateway::KabuAdapter::position_lot(raw);
+            if (!lot.has_value() || lot->symbol != symbol) {
+                continue;
+            }
+            if (lot->side > 0) {
+                long_hold += lot->qty;
+                long_closable += std::max(lot->closable_qty, 0);
+            } else if (lot->side < 0) {
+                short_hold += lot->qty;
+                short_closable += std::max(lot->closable_qty, 0);
+            }
+        }
+
+        if (inventory.side > 0) {
+            broker_hold_qty = long_hold;
+            broker_closable_qty = long_closable;
+        } else if (inventory.side < 0) {
+            broker_hold_qty = short_hold;
+            broker_closable_qty = short_closable;
+        } else {
+            broker_hold_qty = long_hold + short_hold;
+            broker_closable_qty = long_closable + short_closable;
+        }
+
+        const auto now_ns = wall_clock_ns();
+        if (inventory.qty == 0) {
+            has_external_inventory = broker_hold_qty > 0;
+            manual_close_lock = false;
+            if (!has_external_inventory) {
+                exit_blocked_until_ns = 0;
+            }
+            return;
+        }
+
+        if (!has_working_orders() && broker_hold_qty == 0) {
+            inventory = Inventory{};
+            has_external_inventory = false;
+            manual_close_lock = false;
+            exit_blocked_until_ns = 0;
+            broker_hold_qty = 0;
+            broker_closable_qty = 0;
+            has_stranded_partial = false;
+            return;
+        }
+
+        bool qty_mismatch = broker_hold_qty != inventory.qty;
+        if (qty_mismatch && has_working_orders()) {
+            int working_remaining = 0;
+            if (working_order.has_value()) {
+                working_remaining += std::max(working_order->qty - working_order->cum_qty, 0);
+            }
+            if (exit_order.has_value()) {
+                working_remaining += std::max(exit_order->qty - exit_order->cum_qty, 0);
+            }
+            if (std::abs(broker_hold_qty - inventory.qty) <= working_remaining) {
+                qty_mismatch = false;
+            }
+        }
+
+        const bool local_exit_manageable = broker_closable_qty >= inventory.qty;
+        if (qty_mismatch) {
+            has_external_inventory = true;
+            if (local_exit_manageable) {
+                exit_blocked_until_ns = 0;
+            } else {
+                exit_blocked_until_ns = std::max(exit_blocked_until_ns, now_ns + 15'000'000'000LL);
+            }
+        } else {
+            has_external_inventory = false;
+        }
+
+        const bool locked = broker_hold_qty > 0 && broker_closable_qty < std::min(broker_hold_qty, inventory.qty);
+        const bool expected_strategy_lock = locked && has_working_exit();
+        if (!expected_strategy_lock) {
+            manual_close_lock = locked;
+        } else {
+            manual_close_lock = false;
+        }
+        if (locked && !expected_strategy_lock) {
+            exit_blocked_until_ns = std::max(exit_blocked_until_ns, now_ns + 15'000'000'000LL);
+        } else if (!has_external_inventory || local_exit_manageable) {
+            exit_blocked_until_ns = 0;
+        }
+    }
+
+    void sync_external_order_snapshots(const std::map<std::string, gateway::OrderSnapshot>& snapshots) {
+        std::vector<std::string> active_ids;
+        const auto local_ids = active_order_ids();
+        const std::set<std::string> local_id_set(local_ids.begin(), local_ids.end());
+        for (const auto& [order_id, snapshot] : snapshots) {
+            const std::string snapshot_symbol =
+                snapshot.symbol.empty() ? gateway::parse_string(snapshot.raw.value("Symbol", nlohmann::json()), std::string())
+                                        : snapshot.symbol;
+            if (snapshot_symbol != symbol || snapshot.is_final || local_id_set.contains(order_id)) {
+                continue;
+            }
+            active_ids.push_back(order_id);
+        }
+        broker_active_order_ids = std::move(active_ids);
+        has_external_active_orders = !broker_active_order_ids.empty();
+    }
+
   private:
+    [[nodiscard]] std::optional<WorkingOrder>* order_slot(const std::string& order_id) {
+        if (working_order.has_value() && working_order->order_id == order_id) {
+            return &working_order;
+        }
+        if (exit_order.has_value() && exit_order->order_id == order_id) {
+            return &exit_order;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] std::string request_live_entry_order(int side, int qty, double price, bool is_market, std::int64_t now_ns) {
+        if (!entry_order_sender_) {
+            throw std::runtime_error("live entry order sender has not been configured");
+        }
+        try {
+            return entry_order_sender_(side, qty, price, is_market);
+        } catch (const gateway::KabuApiError& error) {
+            const auto code = extract_error_code(error.payload());
+            if (code.has_value() && *code == 4002004) {
+                entry_blocked_until_ns = std::max(entry_blocked_until_ns, now_ns + 15'000'000'000LL);
+                return {};
+            }
+            if (code.has_value() && *code == 100313) {
+                entry_blocked_until_ns = std::max(entry_blocked_until_ns, now_ns + 1'000'000'000LL);
+                return {};
+            }
+            throw;
+        }
+    }
+
+    [[nodiscard]] std::string request_live_exit_order(
+        int position_side,
+        int qty,
+        double price,
+        bool is_market,
+        std::int64_t now_ns
+    ) {
+        if (!exit_order_sender_) {
+            throw std::runtime_error("live exit order sender has not been configured");
+        }
+        try {
+            return exit_order_sender_(position_side, qty, price, is_market);
+        } catch (const gateway::KabuApiError& error) {
+            const auto code = extract_error_code(error.payload());
+            if (code.has_value() && *code == 8) {
+                exit_blocked_until_ns = std::max(exit_blocked_until_ns, now_ns + 15'000'000'000LL);
+                return {};
+            }
+            throw;
+        }
+    }
+
     [[nodiscard]] static double tick_from_table(double reference, bool topix100) {
         const double price = std::max(reference, 0.0);
         if (topix100) {
@@ -444,6 +660,20 @@ class ExecutionController {
         ++stats["cancel_orders"];
         if (dry_run) {
             finalize_order(entry_side, "cancelled");
+        } else {
+            if (!cancel_order_sender_) {
+                slot->cancel_requested = false;
+                throw std::runtime_error("live cancel order sender has not been configured");
+            }
+            try {
+                cancel_order_sender_(slot->order_id);
+            } catch (const gateway::KabuApiError& error) {
+                const auto code = extract_error_code(error.payload());
+                if (!(error.status() == 500 && code.has_value() && *code == 43)) {
+                    slot->cancel_requested = false;
+                    throw;
+                }
+            }
         }
         return true;
     }
@@ -592,6 +822,9 @@ class ExecutionController {
     mutable std::optional<TseTickProfile> tse_tick_profile_;
     int paper_order_counter_{0};
     oms::OrderLedger order_ledger_;
+    EntryOrderSender entry_order_sender_;
+    ExitOrderSender exit_order_sender_;
+    CancelOrderSender cancel_order_sender_;
 };
 
 }  // namespace kabu::execution

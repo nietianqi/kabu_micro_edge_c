@@ -60,6 +60,20 @@ kabu::strategy::MicroEdgeStrategy make_strategy(std::shared_ptr<kabu::TradeJourn
     return {config.symbol(), config.strategy, config.order_profile, true, std::move(journal)};
 }
 
+kabu::strategy::MicroEdgeStrategy make_live_strategy(std::shared_ptr<kabu::TradeJournal> journal = nullptr) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    return {config.symbol(), config.strategy, config.order_profile, false, std::move(journal)};
+}
+
 std::filesystem::path make_temp_dir(const std::string& name) {
     auto path = std::filesystem::temp_directory_path() / ("kabu_micro_edge_c_strategy_" + name);
     std::filesystem::remove_all(path);
@@ -200,4 +214,182 @@ TEST(StrategyTest, EntryFillSchedulesEntryMarkoutInAnalytics) {
     EXPECT_EQ(markout["pending_markouts"].get<int>(), 2);
 
     journal->close();
+}
+
+TEST(StrategyTest, LiveReconcileAppliesBrokerOrderAndPositionSnapshots) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    const auto fill_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    strategy.execution().working_order = kabu::execution::WorkingOrder{
+        "OID-ENTRY",
+        "entry",
+        1,
+        100,
+        1734.5,
+        false,
+        fill_ts - 1'000'000,
+        "long_entry"
+    };
+
+    kabu::gateway::OrderSnapshot snapshot;
+    snapshot.order_id = "OID-ENTRY";
+    snapshot.symbol = "7269";
+    snapshot.exchange = 9;
+    snapshot.side = 1;
+    snapshot.order_qty = 100;
+    snapshot.cum_qty = 100;
+    snapshot.price = 1734.5;
+    snapshot.avg_fill_price = 1734.5;
+    snapshot.is_final = true;
+    snapshot.fill_ts_ns = fill_ts;
+
+    const std::vector<nlohmann::json> positions{
+        nlohmann::json{
+            {"HoldID", "HOLD-1"},
+            {"Symbol", "7269"},
+            {"Exchange", 9},
+            {"Side", "2"},
+            {"LeavesQty", 100},
+            {"ClosableQty", 100},
+            {"Price", 1734.5},
+            {"MarginTradeType", 1},
+        }
+    };
+
+    strategy.reconcile_with_prefetched(positions, std::map<std::string, kabu::gateway::OrderSnapshot>{{"OID-ENTRY", snapshot}}, fill_ts);
+
+    EXPECT_FALSE(strategy.execution().has_working_entry());
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_EQ(strategy.execution().inventory.side, 1);
+    EXPECT_DOUBLE_EQ(strategy.execution().inventory.avg_price, 1734.5);
+    EXPECT_EQ(strategy.execution().broker_hold_qty, 100);
+    EXPECT_EQ(strategy.execution().broker_closable_qty, 100);
+    EXPECT_FALSE(strategy.execution().has_external_inventory);
+}
+
+TEST(StrategyTest, LiveReconcileTracksExternalActiveOrders) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    const std::vector<nlohmann::json> positions{};
+    kabu::gateway::OrderSnapshot external_order;
+    external_order.order_id = "OID-EXTERNAL";
+    external_order.symbol = "7269";
+    external_order.exchange = 9;
+    external_order.side = 1;
+    external_order.order_qty = 100;
+    external_order.cum_qty = 0;
+    external_order.price = 1734.5;
+    external_order.is_final = false;
+
+    strategy.reconcile_with_prefetched(
+        positions,
+        std::map<std::string, kabu::gateway::OrderSnapshot>{{"OID-EXTERNAL", external_order}},
+        kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00")
+    );
+
+    EXPECT_TRUE(strategy.execution().has_external_active_orders);
+    ASSERT_EQ(strategy.execution().broker_active_order_ids.size(), 1U);
+    EXPECT_EQ(strategy.execution().broker_active_order_ids.front(), "OID-EXTERNAL");
+}
+
+TEST(StrategyTest, LiveReconcileRecoversExternalInventoryFromBrokerPositions) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    const std::vector<nlohmann::json> positions{
+        nlohmann::json{
+            {"HoldID", "HOLD-1"},
+            {"Symbol", "7269"},
+            {"Exchange", 9},
+            {"Side", "2"},
+            {"LeavesQty", 200},
+            {"ClosableQty", 200},
+            {"Price", 1734.5},
+            {"MarginTradeType", 1},
+        }
+    };
+
+    strategy.reconcile_with_prefetched(
+        positions,
+        std::map<std::string, kabu::gateway::OrderSnapshot>{},
+        kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00")
+    );
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_EQ(strategy.execution().broker_hold_qty, 200);
+    EXPECT_EQ(strategy.execution().broker_closable_qty, 200);
+    EXPECT_TRUE(strategy.execution().has_external_inventory);
+    EXPECT_TRUE(strategy.execution().has_external_inventory_conflict());
+    EXPECT_FALSE(strategy.execution().manual_close_lock);
+}
+
+TEST(StrategyTest, LiveReconcileClearsRecoveredExternalInventoryWhenBrokerFlattens) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    const auto ts_ns = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    const std::vector<nlohmann::json> positions{
+        nlohmann::json{
+            {"HoldID", "HOLD-1"},
+            {"Symbol", "7269"},
+            {"Exchange", 9},
+            {"Side", "2"},
+            {"LeavesQty", 100},
+            {"ClosableQty", 100},
+            {"Price", 1734.5},
+            {"MarginTradeType", 1},
+        }
+    };
+
+    strategy.reconcile_with_prefetched(positions, std::map<std::string, kabu::gateway::OrderSnapshot>{}, ts_ns);
+    ASSERT_TRUE(strategy.execution().has_external_inventory);
+
+    strategy.reconcile_with_prefetched(
+        std::vector<nlohmann::json>{},
+        std::map<std::string, kabu::gateway::OrderSnapshot>{},
+        ts_ns + 1'000'000
+    );
+
+    EXPECT_FALSE(strategy.execution().has_external_inventory);
+    EXPECT_EQ(strategy.execution().broker_hold_qty, 0);
+    EXPECT_EQ(strategy.execution().broker_closable_qty, 0);
+    EXPECT_FALSE(strategy.execution().manual_close_lock);
+}
+
+TEST(StrategyTest, LiveReconcileClearsRecoveredExternalOrdersAfterBrokerFinalizesThem) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    kabu::gateway::OrderSnapshot external_order;
+    external_order.order_id = "OID-EXTERNAL";
+    external_order.symbol = "7269";
+    external_order.exchange = 9;
+    external_order.side = 1;
+    external_order.order_qty = 100;
+    external_order.cum_qty = 0;
+    external_order.price = 1734.5;
+    external_order.is_final = false;
+
+    const auto ts_ns = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    strategy.reconcile_with_prefetched(
+        std::vector<nlohmann::json>{},
+        std::map<std::string, kabu::gateway::OrderSnapshot>{{"OID-EXTERNAL", external_order}},
+        ts_ns
+    );
+
+    ASSERT_TRUE(strategy.execution().has_external_active_orders);
+
+    external_order.is_final = true;
+    external_order.state_code = 5;
+    external_order.order_state_code = 5;
+    strategy.reconcile_with_prefetched(
+        std::vector<nlohmann::json>{},
+        std::map<std::string, kabu::gateway::OrderSnapshot>{{"OID-EXTERNAL", external_order}},
+        ts_ns + 1'000'000
+    );
+
+    EXPECT_FALSE(strategy.execution().has_external_active_orders);
+    EXPECT_TRUE(strategy.execution().broker_active_order_ids.empty());
 }
