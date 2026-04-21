@@ -120,7 +120,7 @@ void reconcile_startup_state(kabu::app::MicroEdgeApp& app) {
                                               app.build_reconcile_plan(*runtime.strategy).sleep_s;
     }
     app.note_reconcile_success();
-    app.set_recovery_state(false);
+    app.finish_recovery();
 }
 
 void run_reconcile_cycle(kabu::app::MicroEdgeApp& app) {
@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            app.set_recovery_state(true, "startup_recovery");
+            app.begin_startup_recovery();
             app.startup_with_retry([](double delay_s) {
                 std::this_thread::sleep_for(std::chrono::duration<double>(delay_s));
             });
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
                     app.on_trade(trade);
                 },
                 [&]() {
-                    app.set_recovery_state(true, "websocket_reconnect_recovery");
+                    app.begin_reconnect_recovery();
                     app.reregister_symbols();
                     if (websocket_handle != nullptr) {
                         websocket_handle->set_api_token(app.rest().token());

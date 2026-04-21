@@ -73,6 +73,24 @@ struct ReconcileFetchResult {
     std::optional<std::map<std::string, gateway::OrderSnapshot>> order_snapshots;
 };
 
+enum class RecoveryState {
+    Ready,
+    Startup,
+    Reconnect,
+};
+
+inline std::string to_string(RecoveryState state) {
+    switch (state) {
+    case RecoveryState::Ready:
+        return "ready";
+    case RecoveryState::Startup:
+        return "startup_recovery";
+    case RecoveryState::Reconnect:
+        return "reconnect_recovery";
+    }
+    return "ready";
+}
+
 class MicroEdgeApp {
   public:
     static constexpr int RECONCILE_BACKLOG_THRESHOLD = 32;
@@ -224,12 +242,32 @@ class MicroEdgeApp {
         last_reconcile_error_ = std::move(message);
     }
     void note_reconcile_success() { last_reconcile_error_.clear(); }
+    void begin_startup_recovery(std::string reason = "startup_recovery") {
+        set_recovery_state_impl(RecoveryState::Startup, std::move(reason));
+    }
+    void begin_reconnect_recovery(std::string reason = "websocket_reconnect_recovery") {
+        set_recovery_state_impl(RecoveryState::Reconnect, std::move(reason));
+    }
+    void finish_recovery() {
+        recovery_state_ = RecoveryState::Ready;
+        recovery_in_progress_ = false;
+        recovery_reason_.clear();
+        recovery_completed_ts_ns_ = wall_clock_ns();
+    }
     void set_recovery_state(bool in_progress, std::string reason = {}) {
-        recovery_in_progress_ = in_progress;
-        recovery_reason_ = in_progress ? (reason.empty() ? "recovery_in_progress" : std::move(reason)) : std::string{};
+        if (!in_progress) {
+            finish_recovery();
+            return;
+        }
+        if (reason == "websocket_reconnect_recovery") {
+            begin_reconnect_recovery(reason);
+            return;
+        }
+        begin_startup_recovery(reason.empty() ? "recovery_in_progress" : std::move(reason));
     }
     [[nodiscard]] bool recovery_in_progress() const { return recovery_in_progress_; }
     [[nodiscard]] const std::string& recovery_reason() const { return recovery_reason_; }
+    [[nodiscard]] RecoveryState recovery_state() const { return recovery_state_; }
 
     [[nodiscard]] ReconcilePlan build_reconcile_plan(strategy::MicroEdgeStrategy& strategy_obj) const {
         const auto base_sleep_s = base_reconcile_interval_s();
@@ -397,8 +435,13 @@ class MicroEdgeApp {
 
     [[nodiscard]] nlohmann::json status_snapshot() {
         nlohmann::json strategies = nlohmann::json::array();
+        int total_consistency_issue_count = 0;
         for (const auto& [_, runtime] : strategy_runtimes_) {
-            strategies.push_back(runtime.strategy->status());
+            auto status = runtime.strategy->status();
+            total_consistency_issue_count += status
+                                                 .at("execution")
+                                                 .value("consistency_issue_count", 0);
+            strategies.push_back(std::move(status));
         }
         nlohmann::json market_data = {
             {"last_market_data_ts_ns", last_market_data_ts_ns_},
@@ -413,7 +456,10 @@ class MicroEdgeApp {
             {"kill_switch_hard_close", kill_switch_hard_close_},
             {"symbol_count", strategy_runtimes_.size()},
             {"recovery_in_progress", recovery_in_progress_},
+            {"recovery_state", to_string(recovery_state_)},
             {"recovery_reason", recovery_reason_},
+            {"recovery_started_ts_ns", recovery_started_ts_ns_},
+            {"recovery_completed_ts_ns", recovery_completed_ts_ns_},
             {"websocket", websocket_status_provider_ ? websocket_status_provider_() : nlohmann::json{{"status", "unconfigured"}}},
             {"market_data", market_data},
             {"token_refresh_count", token_refresh_count_},
@@ -422,6 +468,8 @@ class MicroEdgeApp {
             {"last_websocket_error", last_websocket_error_},
             {"reconcile_failure_count", reconcile_failure_count_},
             {"last_reconcile_error", last_reconcile_error_},
+            {"consistency_ok", total_consistency_issue_count == 0},
+            {"consistency_issue_count", total_consistency_issue_count},
             {"account_risk", account_risk_snapshot()},
             {"strategies", strategies},
         };
@@ -437,6 +485,13 @@ class MicroEdgeApp {
     [[nodiscard]] bool kill_switch_hard_close() const { return kill_switch_hard_close_; }
 
   private:
+    void set_recovery_state_impl(RecoveryState state, std::string reason) {
+        recovery_state_ = state;
+        recovery_in_progress_ = state != RecoveryState::Ready;
+        recovery_reason_ = recovery_in_progress_ ? std::move(reason) : std::string{};
+        recovery_started_ts_ns_ = wall_clock_ns();
+    }
+
     static void merge_order_snapshots(
         std::map<std::string, gateway::OrderSnapshot>& snapshots,
         const std::vector<nlohmann::json>& raws,
@@ -527,8 +582,11 @@ class MicroEdgeApp {
     std::string last_websocket_error_;
     int reconcile_failure_count_{0};
     std::string last_reconcile_error_;
+    RecoveryState recovery_state_{RecoveryState::Ready};
     bool recovery_in_progress_{false};
     std::string recovery_reason_;
+    std::int64_t recovery_started_ts_ns_{0};
+    std::int64_t recovery_completed_ts_ns_{0};
 };
 
 }  // namespace kabu::app

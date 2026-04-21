@@ -332,3 +332,28 @@ TEST(ExecutionTest, ConsistencyIssuesDetectCanceledLocalOrderThatBrokerFilledLat
         "FILLED"
     );
 }
+
+TEST(ExecutionTest, ConsistencyIssuesDetectBrokerClosableExceedingHold) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    controller.broker_hold_qty = 100;
+    controller.broker_closable_qty = 200;
+
+    const auto issues = controller.consistency_issues();
+    ASSERT_FALSE(issues.empty());
+    EXPECT_EQ(issues.front().code, "broker_closable_gt_hold");
+    EXPECT_FALSE(controller.snapshot().at("consistency_ok").get<bool>());
+}

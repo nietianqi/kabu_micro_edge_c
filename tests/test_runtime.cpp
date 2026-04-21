@@ -137,7 +137,7 @@ TEST(RuntimeTest, AccountEntryGuardBlocksWhileRecoveryIsInProgress) {
 
     kabu::app::MicroEdgeApp app(config);
     app.set_strategy(strategy);
-    app.set_recovery_state(true, "startup_recovery");
+    app.begin_startup_recovery();
 
     const auto guard = app.make_account_entry_guard();
     const auto [allowed, reason] = guard(100, 1735.0);
@@ -146,7 +146,46 @@ TEST(RuntimeTest, AccountEntryGuardBlocksWhileRecoveryIsInProgress) {
     EXPECT_EQ(reason, "startup_recovery");
     const auto status = app.status_snapshot();
     EXPECT_TRUE(status.at("recovery_in_progress").get<bool>());
+    EXPECT_EQ(status.at("recovery_state").get<std::string>(), "startup_recovery");
     EXPECT_EQ(status.at("recovery_reason").get<std::string>(), "startup_recovery");
+}
+
+TEST(RuntimeTest, RecoveryStateTransitionsFromStartupToReady) {
+    auto config = kabu::config::load_config();
+    auto strategy = make_strategy(config, "7269", 9);
+
+    kabu::app::MicroEdgeApp app(config);
+    app.set_strategy(strategy);
+    app.begin_startup_recovery();
+
+    auto status = app.status_snapshot();
+    EXPECT_TRUE(status.at("recovery_in_progress").get<bool>());
+    EXPECT_EQ(status.at("recovery_state").get<std::string>(), "startup_recovery");
+    EXPECT_GT(status.at("recovery_started_ts_ns").get<std::int64_t>(), 0);
+
+    app.finish_recovery();
+
+    status = app.status_snapshot();
+    EXPECT_FALSE(status.at("recovery_in_progress").get<bool>());
+    EXPECT_EQ(status.at("recovery_state").get<std::string>(), "ready");
+    EXPECT_TRUE(status.at("recovery_reason").get<std::string>().empty());
+    EXPECT_GT(status.at("recovery_completed_ts_ns").get<std::int64_t>(), 0);
+}
+
+TEST(RuntimeTest, StatusSnapshotAggregatesStrategyConsistencyIssues) {
+    auto config = kabu::config::load_config();
+    auto strategy = make_strategy(config, "7269", 9);
+    strategy->execution().inventory.side = 1;
+    strategy->execution().inventory.qty = 0;
+
+    kabu::app::MicroEdgeApp app(config);
+    app.set_strategy(strategy);
+
+    const auto status = app.status_snapshot();
+    EXPECT_FALSE(status.at("consistency_ok").get<bool>());
+    EXPECT_GE(status.at("consistency_issue_count").get<int>(), 1);
+    ASSERT_EQ(status.at("strategies").size(), 1U);
+    EXPECT_GE(status.at("strategies")[0].at("execution").at("consistency_issue_count").get<int>(), 1);
 }
 
 TEST(RuntimeTest, FileKillSwitchRequestActivatesSoftStop) {
