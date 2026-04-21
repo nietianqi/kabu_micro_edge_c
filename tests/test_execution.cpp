@@ -235,4 +235,100 @@ TEST(ExecutionTest, BrokerSnapshotIsIdempotentForPartialAndFinalFills) {
     controller.apply_broker_snapshot(final_fill);
     EXPECT_EQ(controller.inventory.qty, 100);
     EXPECT_TRUE(controller.drain_round_trips().empty());
+    EXPECT_EQ(
+        controller.snapshot().at("ledger").at("OID-ENTRY-1").at("broker_status").get<std::string>(),
+        "FILLED"
+    );
+}
+
+TEST(ExecutionTest, LatePartialAfterFinalFillDoesNotRegressBrokerMirror) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    controller.set_live_order_callbacks(
+        [&](int, int, double, bool) { return std::string("OID-ENTRY-1"); },
+        [&](int, int, double, bool) { return std::string("OID-EXIT-1"); },
+        [&](const std::string&) {}
+    );
+
+    ASSERT_TRUE(controller.open_explicit(1, 100, 1734.0, make_board(1734.0, 1734.5), "test", false, "maker", 3));
+
+    kabu::gateway::OrderSnapshot final_fill;
+    final_fill.order_id = "OID-ENTRY-1";
+    final_fill.side = 1;
+    final_fill.order_qty = 100;
+    final_fill.cum_qty = 100;
+    final_fill.price = 1734.0;
+    final_fill.avg_fill_price = 1734.5;
+    final_fill.is_final = true;
+    final_fill.state_code = 5;
+    final_fill.order_state_code = 5;
+    controller.apply_broker_snapshot(final_fill);
+
+    auto stale_partial = final_fill;
+    stale_partial.cum_qty = 40;
+    stale_partial.avg_fill_price = 1734.0;
+    stale_partial.is_final = false;
+    stale_partial.state_code = 3;
+    stale_partial.order_state_code = 3;
+    controller.apply_broker_snapshot(stale_partial);
+
+    const auto ledger = controller.snapshot().at("ledger").at("OID-ENTRY-1");
+    EXPECT_EQ(ledger.at("broker_status").get<std::string>(), "FILLED");
+    EXPECT_EQ(ledger.at("broker_cum_qty").get<int>(), 100);
+    EXPECT_EQ(controller.inventory.qty, 100);
+    EXPECT_TRUE(controller.consistency_issues().empty());
+}
+
+TEST(ExecutionTest, ConsistencyIssuesDetectCanceledLocalOrderThatBrokerFilledLater) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        true,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    ASSERT_TRUE(controller.open_explicit(1, 100, 1734.0, make_board(1734.0, 1734.5, 1200, 1200), "test", false, "maker", 3));
+    ASSERT_TRUE(controller.cancel_working("user_cancel"));
+    EXPECT_FALSE(controller.working_order.has_value());
+
+    kabu::gateway::OrderSnapshot late_fill;
+    late_fill.order_id = "PAPER-7269-1";
+    late_fill.side = 1;
+    late_fill.order_qty = 100;
+    late_fill.cum_qty = 100;
+    late_fill.price = 1734.0;
+    late_fill.avg_fill_price = 1734.5;
+    late_fill.is_final = true;
+    late_fill.state_code = 5;
+    late_fill.order_state_code = 5;
+    controller.apply_broker_snapshot(late_fill);
+
+    const auto issues = controller.consistency_issues();
+    ASSERT_FALSE(issues.empty());
+    EXPECT_EQ(issues.front().code, "canceled_vs_filled");
+    EXPECT_EQ(
+        controller.snapshot().at("ledger").at("PAPER-7269-1").at("broker_status").get<std::string>(),
+        "FILLED"
+    );
 }

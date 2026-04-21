@@ -25,6 +25,11 @@ class ExecutionController {
     using EntryOrderSender = std::function<std::string(int side, int qty, double price, bool is_market)>;
     using ExitOrderSender = std::function<std::string(int position_side, int qty, double price, bool is_market)>;
     using CancelOrderSender = std::function<void(const std::string& order_id)>;
+    struct ConsistencyIssue {
+        std::string code;
+        std::string severity;
+        std::string message;
+    };
 
     ExecutionController(
         std::string symbol,
@@ -331,6 +336,7 @@ class ExecutionController {
 
     [[nodiscard]] nlohmann::json snapshot() const {
         const auto* primary_order = working_order.has_value() ? &*working_order : (exit_order.has_value() ? &*exit_order : nullptr);
+        const auto consistency = consistency_issues();
         return {
             {"state", to_string(state())},
             {"inventory_side", inventory.side},
@@ -362,6 +368,8 @@ class ExecutionController {
             {"active_order_ids", active_order_ids()},
             {"broker_active_order_ids", broker_active_order_ids},
             {"stats", stats},
+            {"consistency_ok", consistency.empty()},
+            {"consistency_issue_count", consistency.size()},
             {"ledger", order_ledger_.snapshot()},
         };
     }
@@ -375,6 +383,13 @@ class ExecutionController {
     }
 
     void apply_broker_snapshot(const gateway::OrderSnapshot& snapshot) {
+        const auto mirror = order_ledger_.observe_broker_snapshot(snapshot.order_id, snapshot);
+        if (mirror.disposition == oms::BrokerSnapshotDisposition::Stale ||
+            mirror.disposition == oms::BrokerSnapshotDisposition::Duplicate ||
+            mirror.disposition == oms::BrokerSnapshotDisposition::FinalRepeat) {
+            return;
+        }
+
         auto* slot = order_slot(snapshot.order_id);
         if (slot == nullptr || !slot->has_value()) {
             return;
@@ -513,6 +528,69 @@ class ExecutionController {
         }
         broker_active_order_ids = std::move(active_ids);
         has_external_active_orders = !broker_active_order_ids.empty();
+    }
+
+    [[nodiscard]] std::vector<ConsistencyIssue> consistency_issues() const {
+        std::vector<ConsistencyIssue> issues;
+        if (inventory.qty == 0 && inventory.side != 0) {
+            issues.push_back({"flat_inventory_side", "high", "inventory side must be zero when quantity is flat"});
+        }
+        if (inventory.qty > 0 && inventory.side == 0) {
+            issues.push_back({"open_inventory_side", "high", "inventory side must be set when quantity is open"});
+        }
+        if (exit_order.has_value() && inventory.qty <= 0) {
+            issues.push_back({"exit_without_inventory", "high", "exit order exists while local inventory is flat"});
+        }
+        if (working_order.has_value() && working_order->purpose != "entry") {
+            issues.push_back({"working_order_purpose", "medium", "working entry slot contains a non-entry order"});
+        }
+        if (exit_order.has_value() && exit_order->purpose != "exit") {
+            issues.push_back({"exit_order_purpose", "medium", "working exit slot contains a non-exit order"});
+        }
+        if (broker_closable_qty > broker_hold_qty) {
+            issues.push_back({"broker_closable_gt_hold", "high", "broker closable quantity exceeds broker hold quantity"});
+        }
+
+        const auto local_ids = active_order_ids();
+        const std::set<std::string> local_id_set(local_ids.begin(), local_ids.end());
+        for (const auto& broker_id : broker_active_order_ids) {
+            if (local_id_set.contains(broker_id)) {
+                issues.push_back({
+                    "broker_local_active_overlap",
+                    "medium",
+                    "broker active orders should not duplicate locally managed active orders",
+                });
+                break;
+            }
+        }
+
+        for (const auto& record : order_ledger_.records()) {
+            if (record.broker_status == oms::OrderStatus::Unknown) {
+                continue;
+            }
+            if (record.broker_cum_qty < record.cum_qty) {
+                issues.push_back({
+                    "broker_cum_qty_regressed",
+                    "high",
+                    "broker cumulative fill quantity is behind the local ledger state",
+                });
+            }
+            if (record.status == oms::OrderStatus::Canceled && record.broker_status == oms::OrderStatus::Filled) {
+                issues.push_back({
+                    "canceled_vs_filled",
+                    "high",
+                    "local ledger marked an order canceled while broker state reports it filled",
+                });
+            }
+            if (record.status == oms::OrderStatus::Filled && record.broker_status == oms::OrderStatus::Canceled) {
+                issues.push_back({
+                    "filled_vs_canceled",
+                    "high",
+                    "local ledger marked an order filled while broker state reports it canceled",
+                });
+            }
+        }
+        return issues;
     }
 
   private:
