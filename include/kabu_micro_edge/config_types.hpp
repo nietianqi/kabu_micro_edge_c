@@ -80,7 +80,7 @@ struct SymbolConfig {
 
 struct StrategyConfig {
     int trade_volume{100};
-    double profit_ticks{2.0};
+    double profit_ticks{1.0};
     double aggressive_taker_profit_ticks{1.0};
     double loss_ticks{3.0};
     double exit_slip_ticks{1.0};

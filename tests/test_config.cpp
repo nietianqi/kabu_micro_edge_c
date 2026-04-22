@@ -29,6 +29,7 @@ TEST(ConfigTest, LoadsDefaultConfig) {
     const auto config = kabu::config::load_config();
     EXPECT_FALSE(config.debug_sendorder_log);
     EXPECT_EQ(config.order_profile.margin_trade_type, 1);
+    EXPECT_DOUBLE_EQ(config.strategy.profit_ticks, 1.0);
     EXPECT_EQ(config.strategy.maker_score_threshold, 6);
     EXPECT_EQ(config.strategy.taker_score_threshold, 9);
     EXPECT_TRUE(config.strategy.aggressive_taker_mode);

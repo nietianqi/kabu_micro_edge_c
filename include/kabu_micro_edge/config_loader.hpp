@@ -65,7 +65,7 @@ inline const nlohmann::json& default_config_json() {
           {"topix100", false}}},
         {"strategy",
          {{"trade_volume", 100},
-          {"profit_ticks", 2.0},
+          {"profit_ticks", 1.0},
           {"aggressive_taker_profit_ticks", 1.0},
           {"loss_ticks", 3.0},
           {"exit_slip_ticks", 1.0},
@@ -378,7 +378,7 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
 
     StrategyConfig strategy;
     strategy.trade_volume = strategy_cfg.value("trade_volume", 100);
-    strategy.profit_ticks = strategy_cfg.value("profit_ticks", 2.0);
+    strategy.profit_ticks = strategy_cfg.value("profit_ticks", 1.0);
     strategy.aggressive_taker_profit_ticks = strategy_cfg.value("aggressive_taker_profit_ticks", 1.0);
     strategy.loss_ticks = strategy_cfg.value("loss_ticks", 3.0);
     strategy.exit_slip_ticks = strategy_cfg.value("exit_slip_ticks", 1.0);

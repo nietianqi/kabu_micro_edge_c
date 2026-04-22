@@ -60,7 +60,7 @@
   ],
   "strategy": {
     "trade_volume": 100,
-    "profit_ticks": 2.0,
+    "profit_ticks": 1.0,
     "aggressive_taker_profit_ticks": 1.0,
     "loss_ticks": 3.0,
     "exit_slip_ticks": 1.0,
