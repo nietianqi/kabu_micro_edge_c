@@ -59,6 +59,7 @@ struct SymbolConfig {
     int exchange{1};
     double tick_size{0.0};
     double max_notional{0.0};
+    int lot_size{100};
     bool topix100{false};
 
     [[nodiscard]] int register_exchange() const {
@@ -165,6 +166,7 @@ struct AppConfig {
     std::string base_url{"http://localhost:18080"};
     std::string ws_url{"ws://localhost:18080/kabusapi/websocket"};
     bool dry_run{true};
+    bool debug_sendorder_log{false};
     int status_interval_s{15};
     int reconcile_interval_ms{500};
     int timer_interval_ms{50};

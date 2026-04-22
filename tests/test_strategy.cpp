@@ -144,6 +144,40 @@ TEST(StrategyTest, DrivesEntryTpLifecycleInDryRun) {
     EXPECT_EQ(strategy.status()["execution"]["scale_in_count"].get<int>(), 0);
 }
 
+TEST(StrategyTest, EntryRoundsDownToConfiguredLotSize) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.symbol().lot_size = 100;
+    config.strategy.trade_volume = 150;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    ASSERT_TRUE(strategy.execution().exit_order.has_value());
+    EXPECT_EQ(strategy.execution().exit_order->qty, 100);
+}
+
 TEST(StrategyTest, KillSwitchBlocksNewEntries) {
     auto strategy = make_strategy();
     strategy.start();
@@ -158,6 +192,40 @@ TEST(StrategyTest, KillSwitchBlocksNewEntries) {
     EXPECT_TRUE(status["risk"]["kill_switch_active"].get<bool>());
     EXPECT_EQ(status["risk"]["kill_switch_reason"].get<std::string>(), "manual_test");
     EXPECT_EQ(status["risk"]["last_entry_block_reason"].get<std::string>(), "kill_switch");
+}
+
+TEST(StrategyTest, EntryBelowLotSizeIsBlockedBeforeOrderSubmission) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000.0;
+    config.symbol().lot_size = 100;
+    config.strategy.trade_volume = 50;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_FALSE(strategy.execution().has_working_entry());
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "lot_size_rounddown");
 }
 
 TEST(StrategyTest, RecoveryGateBlocksNewEntriesInLiveMode) {
@@ -235,7 +303,189 @@ TEST(StrategyTest, ScaleInRequiresLiveTpWorkflow) {
     strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
 
     EXPECT_FALSE(strategy.execution().has_working_entry());
-    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "scale_in_blocked");
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "conflicting_opposite_order");
+}
+
+TEST(StrategyTest, LongInventoryWithManagedTpAllowsScaleIn) {
+    auto strategy = make_strategy();
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 100;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = first_ts - 1'000'000;
+    strategy.execution().exit_order = kabu::execution::WorkingOrder{
+        "EXIT-1",
+        "exit",
+        -1,
+        100,
+        1735.0,
+        false,
+        first_ts - 1'000'000,
+        "limit_tp_quote"
+    };
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 200);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "entered");
+    EXPECT_EQ(strategy.status()["execution"]["scale_in_count"].get<int>(), 1);
+}
+
+TEST(StrategyTest, LongInventoryWithConflictingOppositeOrderBlocksEntry) {
+    auto strategy = make_strategy();
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 100;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = first_ts - 1'000'000;
+    strategy.execution().exit_order = kabu::execution::WorkingOrder{
+        "EXIT-1",
+        "exit",
+        -1,
+        100,
+        1735.0,
+        false,
+        first_ts - 1'000'000,
+        "limit_tp_quote"
+    };
+    strategy.execution().exit_order->cancel_requested = true;
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_FALSE(strategy.execution().has_working_entry());
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "conflicting_opposite_order");
+}
+
+TEST(StrategyTest, ExternalOppositeBrokerOrderBlocksEntry) {
+    auto strategy = make_strategy();
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 100;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = first_ts - 1'000'000;
+    strategy.execution().exit_order = kabu::execution::WorkingOrder{
+        "EXIT-1",
+        "exit",
+        -1,
+        100,
+        1735.0,
+        false,
+        first_ts - 1'000'000,
+        "limit_tp_quote"
+    };
+    strategy.execution().has_external_active_orders = true;
+    strategy.execution().broker_active_order_ids = {"OID-EXTERNAL"};
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_FALSE(strategy.execution().has_working_entry());
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "conflicting_opposite_order");
+}
+
+TEST(StrategyTest, ScaleInPolicyStillAllowsConfiguredThreeLots) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 300;
+    config.strategy.max_scale_in_per_round_trip = 2;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 200;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = first_ts - 1'000'000;
+    strategy.execution().exit_order = kabu::execution::WorkingOrder{
+        "EXIT-1",
+        "exit",
+        -1,
+        200,
+        1735.0,
+        false,
+        first_ts - 1'000'000,
+        "limit_tp_quote"
+    };
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 300);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "entered");
+}
+
+TEST(StrategyTest, ReverseWorkingOrderHardGatePreventsCrossLike100313) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 100;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = first_ts - 1'000'000;
+    strategy.execution().exit_order = kabu::execution::WorkingOrder{
+        "EXIT-1",
+        "exit",
+        -1,
+        100,
+        1735.0,
+        false,
+        first_ts - 1'000'000,
+        "position_timeout"
+    };
+
+    int entry_sends = 0;
+    strategy.execution().set_live_order_callbacks(
+        [&](int, int, double, bool) {
+            ++entry_sends;
+            return std::string("OID-ENTRY-1");
+        },
+        [&](int, int, double, bool) { return std::string("OID-EXIT-1"); },
+        [&](const std::string&) {}
+    );
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(entry_sends, 0);
+    EXPECT_FALSE(strategy.execution().has_working_entry());
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "conflicting_opposite_order");
 }
 
 TEST(StrategyTest, EntryFillSchedulesEntryMarkoutInAnalytics) {

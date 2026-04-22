@@ -3,6 +3,7 @@
   "base_url": "http://localhost:18080",
   "ws_url": "ws://localhost:18080/kabusapi/websocket",
   "dry_run": true,
+  "debug_sendorder_log": false,
   "status_interval_s": 15,
   "reconcile_interval_ms": 500,
   "timer_interval_ms": 50,

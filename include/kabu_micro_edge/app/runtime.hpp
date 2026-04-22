@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <set>
 #include <string>
 #include <utility>
@@ -206,7 +207,7 @@ class MicroEdgeApp {
             register_symbols();
         } catch (const gateway::KabuApiError& error) {
             if (error.status() != 401 && error.status() != 403) {
-                note_rest_error(error.what());
+                note_rest_error(format_gateway_error(error, "register_symbols failed"));
                 throw;
             }
             rest_.get_token(config_.api_password);
@@ -221,7 +222,7 @@ class MicroEdgeApp {
             return fn();
         } catch (const gateway::KabuApiError& error) {
             if (error.status() != 401 && error.status() != 403) {
-                note_rest_error(error.what());
+                note_rest_error(format_gateway_error(error));
                 throw;
             }
             rest_.get_token(config_.api_password);
@@ -233,6 +234,48 @@ class MicroEdgeApp {
 
     void set_websocket_status_provider(std::function<nlohmann::json()> provider) {
         websocket_status_provider_ = std::move(provider);
+    }
+
+    [[nodiscard]] static std::string format_gateway_error(
+        const gateway::KabuApiError& error,
+        const std::string& context = {}
+    ) {
+        std::ostringstream stream;
+        if (!context.empty()) {
+            stream << context << ": ";
+        }
+        stream << error.what();
+
+        std::vector<std::string> details;
+        if (error.status() != 0) {
+            details.push_back("status=" + std::to_string(error.status()));
+        }
+        if (const auto code = gateway::extract_error_code(error.payload()); code.has_value()) {
+            details.push_back("code=" + std::to_string(*code));
+        }
+        if (const auto message = gateway::extract_error_message(error.payload()); message.has_value() && !message->empty()) {
+            details.push_back("message=" + *message);
+        } else if (!error.payload().is_null()) {
+            std::string payload = error.payload().dump();
+            if (payload != "{}" && payload != "[]" && payload != "null" && !payload.empty()) {
+                if (payload.size() > 180) {
+                    payload = payload.substr(0, 177) + "...";
+                }
+                details.push_back("payload=" + payload);
+            }
+        }
+
+        if (!details.empty()) {
+            stream << " [";
+            for (std::size_t index = 0; index < details.size(); ++index) {
+                if (index > 0) {
+                    stream << ", ";
+                }
+                stream << details[index];
+            }
+            stream << "]";
+        }
+        return stream.str();
     }
 
     void note_rest_error(std::string message) { last_rest_error_ = std::move(message); }
@@ -395,12 +438,36 @@ class MicroEdgeApp {
         }
 
         std::map<std::string, gateway::OrderSnapshot> snapshots;
-        for (const auto& order_id : requested_ids) {
-            const auto raws = with_authorization_retry(
-                [&]() { return rest_.get_orders(order_id, 0, gateway::RequestLane::Poll); }
-            );
+        if (requested_ids.size() == 1) {
+            const std::string& order_id = *requested_ids.begin();
+            std::vector<nlohmann::json> raws;
+            try {
+                raws = with_authorization_retry(
+                    [&]() { return rest_.get_orders(order_id, 0, gateway::RequestLane::Poll); }
+                );
+            } catch (const gateway::KabuApiError& error) {
+                const std::string message = format_gateway_error(error, "orders poll failed for order_id=" + order_id);
+                note_rest_error(message);
+                throw gateway::KabuApiError(message, error.status(), error.payload());
+            }
             merge_order_snapshots(snapshots, raws, requested_ids);
+            return snapshots.empty() ? std::nullopt : std::optional<std::map<std::string, gateway::OrderSnapshot>>(snapshots);
         }
+
+        std::vector<nlohmann::json> raws;
+        try {
+            raws = with_authorization_retry(
+                [&]() { return rest_.get_orders(std::nullopt, 0, gateway::RequestLane::Poll); }
+            );
+        } catch (const gateway::KabuApiError& error) {
+            const std::string message = format_gateway_error(
+                error,
+                "orders poll failed while refreshing " + std::to_string(requested_ids.size()) + " active orders"
+            );
+            note_rest_error(message);
+            throw gateway::KabuApiError(message, error.status(), error.payload());
+        }
+        merge_order_snapshots(snapshots, raws, requested_ids);
         return snapshots.empty() ? std::nullopt : std::optional<std::map<std::string, gateway::OrderSnapshot>>(snapshots);
     }
 

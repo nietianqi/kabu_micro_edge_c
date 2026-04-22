@@ -19,6 +19,7 @@ inline const nlohmann::json& default_config_json() {
         {"base_url", "http://localhost:18080"},
         {"ws_url", "ws://localhost:18080/kabusapi/websocket"},
         {"dry_run", true},
+        {"debug_sendorder_log", false},
         {"status_interval_s", 15},
         {"reconcile_interval_ms", 500},
         {"timer_interval_ms", 50},
@@ -60,6 +61,7 @@ inline const nlohmann::json& default_config_json() {
           {"exchange", 9},
           {"tick_size", 0.5},
           {"max_notional", 500000},
+          {"lot_size", 100},
           {"topix100", false}}},
         {"strategy",
          {{"trade_volume", 100},
@@ -160,12 +162,16 @@ inline SymbolConfig load_symbol_config(const nlohmann::json& payload, const std:
     symbol.exchange = payload.value("exchange", 1);
     symbol.tick_size = payload.value("tick_size", 0.0);
     symbol.max_notional = payload.value("max_notional", 0.0);
+    symbol.lot_size = payload.value("lot_size", 100);
     symbol.topix100 = payload.value("topix100", false);
     if (symbol.symbol.empty()) {
         throw std::runtime_error(section_name + ".symbol is required");
     }
     if (symbol.tick_size <= 0) {
         throw std::runtime_error(section_name + ".tick_size must be > 0");
+    }
+    if (symbol.lot_size <= 0) {
+        throw std::runtime_error(section_name + ".lot_size must be > 0");
     }
     return symbol;
 }
@@ -505,6 +511,7 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
     config.base_url = payload.value("base_url", std::string("http://localhost:18080"));
     config.ws_url = payload.value("ws_url", std::string("ws://localhost:18080/kabusapi/websocket"));
     config.dry_run = payload.value("dry_run", true);
+    config.debug_sendorder_log = payload.value("debug_sendorder_log", false);
     config.status_interval_s = status_interval_s;
     config.reconcile_interval_ms = reconcile_interval_ms;
     config.timer_interval_ms = timer_interval_ms;

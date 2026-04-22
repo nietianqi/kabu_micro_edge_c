@@ -43,6 +43,7 @@ class ExecutionController {
         int min_order_lifetime_ms,
         int max_requotes_per_minute,
         bool allow_aggressive_exit,
+        int lot_size = 100,
         bool topix100 = false,
         bool queue_model = true
     )
@@ -56,6 +57,7 @@ class ExecutionController {
           max_pending_ns_(std::max(max_pending_ms, 0) * 1'000'000LL),
           min_order_lifetime_ns_(std::max(min_order_lifetime_ms, 0) * 1'000'000LL),
           allow_aggressive_exit_(allow_aggressive_exit),
+          lot_size_(std::max(lot_size, 1)),
           topix100_(topix100),
           queue_model_(queue_model),
           requotes(max_requotes_per_minute) {
@@ -129,9 +131,40 @@ class ExecutionController {
     [[nodiscard]] bool has_external_inventory_conflict() const {
         return has_external_inventory || manual_close_lock || has_external_active_orders;
     }
+    [[nodiscard]] bool managed_tp_exit_is_scale_in_compatible() const {
+        if (!exit_order.has_value() || inventory.qty <= 0 || inventory.side <= 0) {
+            return false;
+        }
+        const auto& order = *exit_order;
+        if (order.purpose != "exit" || order.cancel_requested || order.side != -inventory.side) {
+            return false;
+        }
+        if (!order.reason.starts_with("limit_tp")) {
+            return false;
+        }
+        if (manual_close_lock || has_external_active_orders || has_external_inventory) {
+            return false;
+        }
+        return broker_closable_qty <= 0 || broker_closable_qty >= inventory.qty;
+    }
+    [[nodiscard]] bool has_conflicting_opposite_order() const {
+        if (manual_close_lock || has_external_active_orders || has_external_inventory) {
+            return true;
+        }
+        if (!exit_order.has_value()) {
+            return false;
+        }
+        if (inventory.qty <= 0 || inventory.side == 0) {
+            return true;
+        }
+        if (exit_order->side != -inventory.side) {
+            return false;
+        }
+        return !managed_tp_exit_is_scale_in_compatible();
+    }
 
     [[nodiscard]] bool can_manage_local_exit() const {
-        if (inventory.qty <= 0 || manual_close_lock) {
+        if (inventory.qty <= 0 || manual_close_lock || has_external_active_orders) {
             return false;
         }
         return !has_external_inventory || broker_closable_qty >= inventory.qty;
@@ -180,7 +213,8 @@ class ExecutionController {
         int entry_score = 0
     ) {
         const auto now_ns = event_now_ns(snapshot.ts_ns);
-        if (!can_open_entry(direction, qty, now_ns)) {
+        const int aligned_qty = align_order_qty_to_lot_size(qty);
+        if (!can_open_entry(direction, aligned_qty, now_ns)) {
             return false;
         }
         ++stats["open_attempts"];
@@ -188,21 +222,21 @@ class ExecutionController {
         const bool should_fill_immediately = is_market || (direction > 0 && order_price >= snapshot.ask && snapshot.ask > 0) ||
                                              (direction < 0 && order_price <= snapshot.bid && snapshot.bid > 0);
         const std::string order_id =
-            dry_run ? next_paper_order_id() : request_live_entry_order(direction, qty, order_price, is_market, now_ns);
+            dry_run ? next_paper_order_id() : request_live_entry_order(direction, aligned_qty, order_price, is_market, now_ns);
         if (order_id.empty()) {
             return false;
         }
         working_order = WorkingOrder{
-            order_id, "entry", direction, qty, order_price, is_market, now_ns, reason, mode,
+            order_id, "entry", direction, aligned_qty, order_price, is_market, now_ns, reason, mode,
             0, 0.0, false, 0, 0, entry_score, ""
         };
-        order_ledger_.add({working_order->order_id, symbol, direction, qty, order_price});
+        order_ledger_.add({working_order->order_id, symbol, direction, aligned_qty, order_price});
         order_ledger_.mark_working(working_order->order_id);
         ++stats["sent_orders"];
 
         if (dry_run && should_fill_immediately) {
             working_order->fill_reason = is_market ? "market_cross" : "quote_cross";
-            apply_fill(*working_order, qty, direction > 0 ? snapshot.ask : snapshot.bid, now_ns);
+            apply_fill(*working_order, aligned_qty, direction > 0 ? snapshot.ask : snapshot.bid, now_ns);
             finalize_order(true, "filled");
         } else if (dry_run && queue_model_) {
             working_order->queue_ahead_qty = direction > 0 ? snapshot.bid_size : snapshot.ask_size;
@@ -236,20 +270,22 @@ class ExecutionController {
         std::optional<double> target_price = std::nullopt
     ) {
         const auto now_ns = event_now_ns(snapshot.ts_ns);
-        if (inventory.qty <= 0 || now_ns < exit_blocked_until_ns) {
+        const int aligned_qty = align_order_qty_to_lot_size(inventory.qty);
+        if (aligned_qty <= 0 || now_ns < exit_blocked_until_ns) {
             return false;
         }
-        ++stats["close_attempts"];
         const bool is_market = force && allow_aggressive_exit_;
         const double raw_price =
             is_market ? (inventory.side > 0 ? snapshot.bid : snapshot.ask)
                       : target_price.value_or(inventory.side > 0 ? snapshot.ask : snapshot.bid);
         const double order_price = is_market ? raw_price : align_close_price_to_tse_tick(raw_price, inventory.side, target_price, snapshot);
+        if (has_external_active_orders || has_equivalent_working_exit_request(-inventory.side, aligned_qty, order_price, is_market, reason)) {
+            return false;
+        }
+        ++stats["close_attempts"];
 
         if (exit_order.has_value()) {
-            const bool same_order =
-                exit_order->qty == inventory.qty && exit_order->side == -inventory.side &&
-                std::abs(exit_order->price - order_price) <= 1e-9 && exit_order->is_market == is_market;
+            const bool same_order = has_equivalent_working_exit_request(-inventory.side, aligned_qty, order_price, is_market, reason);
             if (same_order || exit_order->cancel_requested) {
                 return false;
             }
@@ -260,19 +296,20 @@ class ExecutionController {
         }
 
         const std::string order_id =
-            dry_run ? next_paper_order_id() : request_live_exit_order(inventory.side, inventory.qty, order_price, is_market, now_ns);
+            dry_run ? next_paper_order_id()
+                    : request_live_exit_order(inventory.side, aligned_qty, order_price, is_market, now_ns);
         if (order_id.empty()) {
             return false;
         }
 
-        exit_order = WorkingOrder{order_id, "exit", -inventory.side, inventory.qty, order_price, is_market, now_ns, reason};
+        exit_order = WorkingOrder{order_id, "exit", -inventory.side, aligned_qty, order_price, is_market, now_ns, reason};
         order_ledger_.add({exit_order->order_id, symbol, exit_order->side, exit_order->qty, order_price});
         order_ledger_.mark_working(exit_order->order_id);
         ++stats["sent_orders"];
 
         if (dry_run && is_market) {
             exit_order->fill_reason = "market_cross";
-            apply_fill(*exit_order, inventory.qty, inventory.side > 0 ? snapshot.bid : snapshot.ask, now_ns);
+            apply_fill(*exit_order, aligned_qty, inventory.side > 0 ? snapshot.bid : snapshot.ask, now_ns);
             finalize_order(false, "filled");
         }
         (void)score;
@@ -724,8 +761,31 @@ class ExecutionController {
     [[nodiscard]] static std::int64_t order_age_ns(const std::optional<WorkingOrder>& order, std::int64_t now_ns) {
         return order.has_value() ? std::max<std::int64_t>(0, now_ns - order->sent_ts_ns) : 0;
     }
+    [[nodiscard]] static std::string close_reason_family(const std::string& reason) {
+        return reason.starts_with("limit_tp") ? "limit_tp" : reason;
+    }
+    [[nodiscard]] bool has_equivalent_working_exit_request(
+        int side,
+        int qty,
+        double price,
+        bool is_market,
+        const std::string& reason
+    ) const {
+        if (!exit_order.has_value() || exit_order->cancel_requested) {
+            return false;
+        }
+        const auto& order = *exit_order;
+        return order.purpose == "exit" && order.side == side && order.qty >= qty && order.is_market == is_market &&
+               std::abs(order.price - price) <= 1e-9 && close_reason_family(order.reason) == close_reason_family(reason);
+    }
 
     [[nodiscard]] std::int64_t event_now_ns(std::int64_t hinted) const { return hinted > 0 ? hinted : wall_clock_ns(); }
+    [[nodiscard]] int align_order_qty_to_lot_size(int qty) const {
+        if (qty <= 0) {
+            return 0;
+        }
+        return (qty / lot_size_) * lot_size_;
+    }
 
     [[nodiscard]] bool can_open_entry(int direction, int qty, std::int64_t now_ns) const {
         if (working_order.has_value() || qty <= 0 || now_ns < entry_blocked_until_ns) {
@@ -941,6 +1001,7 @@ class ExecutionController {
     std::int64_t max_pending_ns_{0};
     std::int64_t min_order_lifetime_ns_{0};
     bool allow_aggressive_exit_{false};
+    int lot_size_{100};
     bool topix100_{false};
     bool queue_model_{true};
     mutable std::optional<TseTickProfile> tse_tick_profile_;

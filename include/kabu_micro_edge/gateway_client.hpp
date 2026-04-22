@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -108,9 +109,11 @@ class KabuRestClient {
     void set_request_executor(RequestExecutor executor) { executor_ = std::move(executor); }
     void set_token(std::string token) { token_ = std::move(token); }
     void set_password(std::string password) { password_ = std::move(password); }
+    void set_debug_sendorder_log(bool enabled) { debug_sendorder_log_ = enabled; }
     [[nodiscard]] const std::string& token() const { return token_; }
     [[nodiscard]] const std::string& password() const { return password_; }
     [[nodiscard]] bool running() const { return running_; }
+    [[nodiscard]] bool debug_sendorder_log() const { return debug_sendorder_log_; }
 
     [[nodiscard]] RequestLane bucket_for_request(
         const std::string& method,
@@ -243,6 +246,37 @@ class KabuRestClient {
 
   private:
     nlohmann::json sendorder_with_exchange_retry(const std::string& symbol, int exchange, const nlohmann::json& body);
+    void log_sendorder_attempt(
+        const std::string& symbol,
+        int exchange,
+        const nlohmann::json& body,
+        int attempt_no,
+        bool retry_exchange_fallback
+    ) const;
+    void log_sendorder_success(
+        const std::string& symbol,
+        int exchange,
+        const nlohmann::json& body,
+        int attempt_no,
+        bool retry_exchange_fallback,
+        const nlohmann::json& response
+    ) const;
+    void log_sendorder_error(
+        const std::string& symbol,
+        int exchange,
+        const nlohmann::json& body,
+        int attempt_no,
+        bool retry_exchange_fallback,
+        const KabuApiError& error
+    ) const;
+    void emit_sendorder_log(nlohmann::json event) const;
+    [[nodiscard]] static nlohmann::json make_sendorder_log_base(
+        const std::string& symbol,
+        int exchange,
+        const nlohmann::json& body,
+        int attempt_no,
+        bool retry_exchange_fallback
+    );
     std::pair<std::vector<nlohmann::json>, std::vector<PositionLot>> build_close_positions(
         const std::string& symbol,
         int exchange,
@@ -260,6 +294,7 @@ class KabuRestClient {
     TokenBucket poll_bucket_;
     RequestExecutor executor_;
     bool running_{false};
+    bool debug_sendorder_log_{false};
 };
 
 struct WebSocketStatusSnapshot {
@@ -500,42 +535,17 @@ inline nlohmann::json KabuRestClient::send_exit_order(
     body["MarginTradeType"] = resolve_margin_trade_type(profile.margin_trade_type, close_build.second);
     body["DelivType"] = profile.margin_close_deliv_type;
     body["ClosePositions"] = close_build.first;
-
-    try {
-        return sendorder_with_exchange_retry(symbol, route_exchange, body);
-    } catch (const KabuApiError& error) {
-        const auto code = extract_error_code(error.payload());
-        if (!code.has_value() || *code != 8) {
-            throw;
-        }
-
-        auto retry_build = build_close_positions(symbol, route_exchange, position_side, qty, false, sor_route);
-        int retry_exchange = route_exchange;
-        std::set<int> exchanges;
-        for (const auto& position : retry_build.second) {
-            if (position.exchange > 0) {
-                exchanges.insert(position.exchange);
-            }
-        }
-        if (!sor_route && exchanges.size() == 1) {
-            retry_exchange = *exchanges.begin();
-        }
-
-        auto retry_body = body;
-        retry_body["Exchange"] = retry_exchange;
-        retry_body["MarginTradeType"] = resolve_margin_trade_type(profile.margin_trade_type, retry_build.second);
-        retry_body["ClosePositions"] = retry_build.first;
-        return sendorder_with_exchange_retry(symbol, retry_exchange, retry_body);
-    }
+    return sendorder_with_exchange_retry(symbol, route_exchange, body);
 }
 
 inline nlohmann::json KabuRestClient::sendorder_with_exchange_retry(
-    const std::string&,
+    const std::string& symbol,
     int exchange,
     const nlohmann::json& body
 ) {
+    log_sendorder_attempt(symbol, exchange, body, 1, false);
     try {
-        return request_json(
+        const auto response = request_json(
             "POST",
             "/kabusapi/sendorder",
             body,
@@ -543,22 +553,133 @@ inline nlohmann::json KabuRestClient::sendorder_with_exchange_retry(
             true,
             RequestLane::Order
         );
+        log_sendorder_success(symbol, exchange, body, 1, false, response);
+        return response;
     } catch (const KabuApiError& error) {
+        log_sendorder_error(symbol, exchange, body, 1, false, error);
         const auto code = extract_error_code(error.payload());
         if (exchange != 1 || !code.has_value() || (*code != 100368 && *code != 100378)) {
             throw;
         }
         auto retry_body = body;
         retry_body["Exchange"] = 27;
-        return request_json(
-            "POST",
-            "/kabusapi/sendorder",
-            retry_body,
-            nlohmann::json::object(),
-            true,
-            RequestLane::Order
-        );
+        log_sendorder_attempt(symbol, 27, retry_body, 2, true);
+        try {
+            const auto response = request_json(
+                "POST",
+                "/kabusapi/sendorder",
+                retry_body,
+                nlohmann::json::object(),
+                true,
+                RequestLane::Order
+            );
+            log_sendorder_success(symbol, 27, retry_body, 2, true, response);
+            return response;
+        } catch (const KabuApiError& retry_error) {
+            log_sendorder_error(symbol, 27, retry_body, 2, true, retry_error);
+            throw;
+        }
     }
+}
+
+inline void KabuRestClient::log_sendorder_attempt(
+    const std::string& symbol,
+    int exchange,
+    const nlohmann::json& body,
+    int attempt_no,
+    bool retry_exchange_fallback
+) const {
+    auto event = make_sendorder_log_base(symbol, exchange, body, attempt_no, retry_exchange_fallback);
+    event["event"] = "sendorder_attempt";
+    emit_sendorder_log(std::move(event));
+}
+
+inline void KabuRestClient::log_sendorder_success(
+    const std::string& symbol,
+    int exchange,
+    const nlohmann::json& body,
+    int attempt_no,
+    bool retry_exchange_fallback,
+    const nlohmann::json& response
+) const {
+    auto event = make_sendorder_log_base(symbol, exchange, body, attempt_no, retry_exchange_fallback);
+    event["event"] = "sendorder_result";
+    event["result"] = "success";
+    const std::string order_id = parse_string(
+        response.contains("OrderId") ? response.at("OrderId") : response.value("ID", nlohmann::json()),
+        std::string()
+    );
+    if (!order_id.empty()) {
+        event["order_id"] = order_id;
+    }
+    emit_sendorder_log(std::move(event));
+}
+
+inline void KabuRestClient::log_sendorder_error(
+    const std::string& symbol,
+    int exchange,
+    const nlohmann::json& body,
+    int attempt_no,
+    bool retry_exchange_fallback,
+    const KabuApiError& error
+) const {
+    auto event = make_sendorder_log_base(symbol, exchange, body, attempt_no, retry_exchange_fallback);
+    event["event"] = "sendorder_result";
+    event["result"] = "error";
+    event["http_status"] = error.status();
+    if (const auto code = extract_error_code(error.payload()); code.has_value()) {
+        event["error_code"] = *code;
+    }
+    if (const auto message = extract_error_message(error.payload()); message.has_value() && !message->empty()) {
+        event["error_message"] = *message;
+    }
+    emit_sendorder_log(std::move(event));
+}
+
+inline void KabuRestClient::emit_sendorder_log(nlohmann::json event) const {
+    if (!debug_sendorder_log_) {
+        return;
+    }
+    std::cerr << event.dump() << '\n';
+}
+
+inline nlohmann::json KabuRestClient::make_sendorder_log_base(
+    const std::string& symbol,
+    int exchange,
+    const nlohmann::json& body,
+    int attempt_no,
+    bool retry_exchange_fallback
+) {
+    nlohmann::json event = {
+        {"symbol", parse_string(body.value("Symbol", nlohmann::json()), symbol)},
+        {"exchange", parse_int(body.value("Exchange", nlohmann::json()), exchange)},
+        {"qty", parse_int(body.value("Qty", nlohmann::json()))},
+        {"side", parse_string(body.value("Side", nlohmann::json()))},
+        {"cash_margin", parse_int(body.value("CashMargin", nlohmann::json()))},
+        {"account_type", parse_int(body.value("AccountType", nlohmann::json()))},
+        {"front_order_type", parse_int(body.value("FrontOrderType", nlohmann::json()))},
+        {"price", parse_float(body.value("Price", nlohmann::json()))},
+        {"attempt_no", attempt_no},
+        {"retry_exchange_fallback", retry_exchange_fallback},
+    };
+    if (body.contains("MarginTradeType") && !body.at("MarginTradeType").is_null()) {
+        event["margin_trade_type"] = parse_int(body.at("MarginTradeType"));
+    }
+    if (body.contains("DelivType") && !body.at("DelivType").is_null()) {
+        event["deliv_type"] = parse_int(body.at("DelivType"));
+    }
+    if (body.contains("FundType") && !body.at("FundType").is_null()) {
+        event["fund_type"] = parse_string(body.at("FundType"));
+    }
+    if (body.contains("ClosePositions") && body.at("ClosePositions").is_array()) {
+        int total_qty = 0;
+        for (const auto& position : body.at("ClosePositions")) {
+            total_qty += parse_int(position.value("Qty", nlohmann::json()));
+        }
+        event["close_positions_count"] = static_cast<int>(body.at("ClosePositions").size());
+        event["close_positions_total_qty"] = total_qty;
+    }
+    return event;
 }
 
 inline std::pair<std::vector<nlohmann::json>, std::vector<PositionLot>> KabuRestClient::build_close_positions(

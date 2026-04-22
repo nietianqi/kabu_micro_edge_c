@@ -262,8 +262,8 @@ TEST(RuntimeTest, MaybePollKillSwitchHonorsConfiguredInterval) {
 TEST(RuntimeTest, BuildRegisterPayloadUsesRegisterExchangeNormalization) {
     auto config = kabu::config::load_config();
     config.symbols.clear();
-    config.symbols.push_back({"7269", 9, 0.5, 500000.0, false});
-    config.symbols.push_back({"7203", 1, 1.0, 500000.0, false});
+    config.symbols.push_back({"7269", 9, 0.5, 500000.0, 100, false});
+    config.symbols.push_back({"7203", 1, 1.0, 500000.0, 100, false});
 
     kabu::app::MicroEdgeApp app(config);
     const auto payload = app.build_register_payload();
@@ -451,6 +451,75 @@ TEST(RuntimeTest, CollectReconcileInputsFetchesTargetedOrdersWithoutPositions) {
     EXPECT_EQ(order_calls, 1);
 }
 
+TEST(RuntimeTest, CollectActiveOrderSnapshotsUsesSingleFullOrdersPollForMultipleIds) {
+    auto config = kabu::config::load_config();
+    kabu::app::MicroEdgeApp app(config);
+
+    int order_calls = 0;
+    app.set_rest_request_executor(
+        [&](const std::string& method,
+            const std::string& url,
+            const nlohmann::json&,
+            const nlohmann::json& params,
+            bool include_token,
+            kabu::gateway::RequestLane lane) -> kabu::gateway::TransportResponse {
+            if (url.ends_with("/kabusapi/orders")) {
+                ++order_calls;
+                EXPECT_EQ(method, "GET");
+                EXPECT_TRUE(include_token);
+                EXPECT_EQ(lane, kabu::gateway::RequestLane::Poll);
+                EXPECT_EQ(params.at("product").get<int>(), 0);
+                EXPECT_FALSE(params.contains("id"));
+                return {200,
+                        nlohmann::json::array(
+                            {nlohmann::json{
+                                 {"ID", "OID-1"},
+                                 {"Symbol", "7269"},
+                                 {"Exchange", 9},
+                                 {"State", 3},
+                                 {"OrderState", 3},
+                                 {"Side", "2"},
+                                 {"OrderQty", 100},
+                                 {"CumQty", 10},
+                                 {"Price", 1735.0},
+                             },
+                             nlohmann::json{
+                                 {"ID", "OID-2"},
+                                 {"Symbol", "7013"},
+                                 {"Exchange", 9},
+                                 {"State", 3},
+                                 {"OrderState", 3},
+                                 {"Side", "1"},
+                                 {"OrderQty", 200},
+                                 {"CumQty", 40},
+                                 {"Price", 1050.0},
+                             },
+                             nlohmann::json{
+                                 {"ID", "OID-IGNORED"},
+                                 {"Symbol", "5032"},
+                                 {"Exchange", 9},
+                                 {"State", 3},
+                                 {"OrderState", 3},
+                                 {"Side", "2"},
+                                 {"OrderQty", 300},
+                                 {"CumQty", 0},
+                                 {"Price", 999.0},
+                             }})};
+            }
+            return {404, nlohmann::json::object()};
+        }
+    );
+
+    const auto snapshots = app.collect_active_order_snapshots({"OID-1", "OID-2"});
+
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_EQ(order_calls, 1);
+    ASSERT_EQ(snapshots->size(), 2U);
+    ASSERT_TRUE(snapshots->contains("OID-1"));
+    ASSERT_TRUE(snapshots->contains("OID-2"));
+    EXPECT_FALSE(snapshots->contains("OID-IGNORED"));
+}
+
 TEST(RuntimeTest, CollectReconcileInputsPropagatesOrderPollFailure) {
     auto config = kabu::config::load_config();
     kabu::app::MicroEdgeApp app(config);
@@ -469,11 +538,22 @@ TEST(RuntimeTest, CollectReconcileInputsPropagatesOrderPollFailure) {
         }
     );
 
-    EXPECT_THROW(
-        (void)app.collect_reconcile_inputs({kabu::app::ReconcilePlan{"orders", 0.5, false, {"OID-1"}}}),
-        kabu::gateway::KabuApiError
-    );
-    EXPECT_FALSE(app.status_snapshot().at("last_rest_error").get<std::string>().empty());
+    try {
+        (void)app.collect_reconcile_inputs({kabu::app::ReconcilePlan{"orders", 0.5, false, {"OID-1"}}});
+        FAIL() << "expected collect_reconcile_inputs to propagate order poll failure";
+    } catch (const kabu::gateway::KabuApiError& error) {
+        EXPECT_EQ(error.status(), 503);
+        const std::string message = error.what();
+        EXPECT_NE(message.find("order_id=OID-1"), std::string::npos);
+        EXPECT_NE(message.find("status=503"), std::string::npos);
+        EXPECT_NE(message.find("code=503"), std::string::npos);
+        EXPECT_NE(message.find("message=temporary failure"), std::string::npos);
+    }
+
+    const std::string last_rest_error = app.status_snapshot().at("last_rest_error").get<std::string>();
+    EXPECT_NE(last_rest_error.find("order_id=OID-1"), std::string::npos);
+    EXPECT_NE(last_rest_error.find("status=503"), std::string::npos);
+    EXPECT_NE(last_rest_error.find("message=temporary failure"), std::string::npos);
 }
 
 TEST(RuntimeTest, CollectStartupRecoveryInputsFetchesFullBrokerState) {

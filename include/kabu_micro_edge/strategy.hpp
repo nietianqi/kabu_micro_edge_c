@@ -69,6 +69,7 @@ class MicroEdgeStrategy {
               config_.min_order_lifetime_ms,
               config_.max_requotes_per_minute,
               config_.allow_aggressive_exit,
+              symbol_config_.lot_size,
               symbol_config_.topix100,
               true
           ),
@@ -302,23 +303,8 @@ class MicroEdgeStrategy {
     }
 
     [[nodiscard]] bool can_scale_in_with_live_tp() const {
-        if (position_timeout_exit_required_) {
-            return false;
-        }
-        if (!execution_.exit_order.has_value()) {
-            return false;
-        }
-        const auto& exit_order = *execution_.exit_order;
-        if (exit_order.cancel_requested) {
-            return false;
-        }
-        if (!exit_order.reason.starts_with("limit_tp")) {
-            return false;
-        }
-        if (execution_.inventory.qty <= 0 || execution_.inventory.side <= 0) {
-            return false;
-        }
-        return round_scale_in_count_ < config_.max_scale_in_per_round_trip;
+        return !position_timeout_exit_required_ && execution_.managed_tp_exit_is_scale_in_compatible() &&
+               round_scale_in_count_ < config_.max_scale_in_per_round_trip;
     }
 
     bool validate_market_quality(std::int64_t now_ns, std::string& reason) const {
@@ -338,19 +324,21 @@ class MicroEdgeStrategy {
         if (!latest_board_.has_value() || !latest_signal_.has_value() || kill_switch_active_) { last_entry_block_reason_ = kill_switch_active_ ? "kill_switch" : last_entry_block_reason_; return; }
         std::string market_reason; if (!validate_market_quality(now_ns, market_reason)) { last_entry_block_reason_ = market_reason; long_confirm_ = 0; return; }
         if (execution_.has_working_entry()) { last_entry_block_reason_ = "working_order"; return; }
+        if (execution_.has_conflicting_opposite_order()) { last_entry_block_reason_ = "conflicting_opposite_order"; return; }
         if (execution_.inventory.qty > 0 && !can_scale_in_with_live_tp()) { last_entry_block_reason_ = "scale_in_blocked"; return; }
-        if (execution_.has_external_inventory_conflict()) { last_entry_block_reason_ = "external_inventory"; return; }
         const auto risk_gate = risk_.can_enter(now_ns); if (!risk_gate.first) { last_entry_block_reason_ = risk_gate.second; return; }
         const auto decision = evaluate_long_signal(*latest_board_, *latest_signal_, config_); if (!decision.allow) { last_entry_block_reason_ = decision.reason; long_confirm_ = 0; return; }
-        if (entry_guard_) { const auto guard = entry_guard_(config_.trade_volume, latest_board_->ask); if (!guard.first) { last_entry_block_reason_ = guard.second; return; } }
-        if (now_ns - last_entry_order_action_ns_ < static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) { last_entry_block_reason_ = "entry_interval"; return; }
-        if (++long_confirm_ < decision.required_confirm) { last_entry_block_reason_ = "confirming"; return; }
-        long_confirm_ = 0;
         int order_qty = std::min(config_.trade_volume, std::max(config_.max_long_inventory - execution_.inventory.qty, 0));
         if (symbol_config_.max_notional > 0 && latest_board_->ask > 0) {
             order_qty = std::min(order_qty, static_cast<int>(symbol_config_.max_notional / latest_board_->ask));
         }
         if (order_qty <= 0) { last_entry_block_reason_ = "symbol_inventory_limit"; return; }
+        order_qty = align_order_qty_to_lot_size(order_qty);
+        if (order_qty <= 0) { last_entry_block_reason_ = "lot_size_rounddown"; return; }
+        if (entry_guard_) { const auto guard = entry_guard_(order_qty, latest_board_->ask); if (!guard.first) { last_entry_block_reason_ = guard.second; return; } }
+        if (now_ns - last_entry_order_action_ns_ < static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) { last_entry_block_reason_ = "entry_interval"; return; }
+        if (++long_confirm_ < decision.required_confirm) { last_entry_block_reason_ = "confirming"; return; }
+        long_confirm_ = 0;
         const double entry_price = decision.entry_mode == ENTRY_MODE_TAKER ? latest_board_->ask : latest_board_->bid;
         working_entry_mode_ = decision.entry_mode;
         working_entry_score_ = decision.entry_score;
@@ -540,6 +528,13 @@ class MicroEdgeStrategy {
                                     ? config_.aggressive_taker_profit_ticks
                                     : config_.profit_ticks;
         return execution_.align_close_price_to_tse_tick(execution_.inventory.avg_price + tp_ticks * tick, execution_.inventory.side, execution_.inventory.avg_price, *latest_board_);
+    }
+
+    [[nodiscard]] int align_order_qty_to_lot_size(int qty) const {
+        if (qty <= 0) {
+            return 0;
+        }
+        return (qty / std::max(symbol_config_.lot_size, 1)) * std::max(symbol_config_.lot_size, 1);
     }
 
     void clear_pending_tp() {

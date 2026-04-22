@@ -202,6 +202,7 @@ int main(int argc, char** argv) {
         const bool strategy_dry_run = config.dry_run || health_check;
         kabu::app::MicroEdgeApp app(config);
         app.set_running(true);
+        app.rest().set_debug_sendorder_log(config.debug_sendorder_log);
 
         if (!config.dry_run) {
             app.set_rest_request_executor(kabu::gateway::make_live_rest_request_executor(app.rest()));

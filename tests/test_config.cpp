@@ -27,10 +27,20 @@ std::filesystem::path write_config(const std::filesystem::path& dir, const nlohm
 
 TEST(ConfigTest, LoadsDefaultConfig) {
     const auto config = kabu::config::load_config();
+    EXPECT_FALSE(config.debug_sendorder_log);
     EXPECT_EQ(config.order_profile.margin_trade_type, 1);
     EXPECT_EQ(config.strategy.maker_score_threshold, 6);
     EXPECT_EQ(config.strategy.taker_score_threshold, 9);
     EXPECT_TRUE(config.strategy.aggressive_taker_mode);
+    EXPECT_EQ(config.symbol().lot_size, 100);
+}
+
+TEST(ConfigTest, LoadsDebugSendorderLogOverride) {
+    const auto dir = make_temp_dir("config_debug_sendorder_log");
+    const auto path = write_config(dir, {{"debug_sendorder_log", true}});
+
+    const auto config = kabu::config::load_config(path);
+    EXPECT_TRUE(config.debug_sendorder_log);
 }
 
 TEST(ConfigTest, RejectsRetiredFields) {
@@ -72,5 +82,44 @@ TEST(ConfigTest, RejectsAmbiguousNormalizedRoutes) {
              }},
         }
     );
+    EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
+}
+
+TEST(ConfigTest, LoadsCustomLotSizeFromSymbolConfig) {
+    const auto dir = make_temp_dir("config_lot_size");
+    const auto path = write_config(
+        dir,
+        {
+            {"symbol",
+             {
+                 {"symbol", "7269"},
+                 {"exchange", 9},
+                 {"tick_size", 0.5},
+                 {"max_notional", 500000},
+                 {"lot_size", 1000},
+             }},
+        }
+    );
+
+    const auto config = kabu::config::load_config(path);
+    EXPECT_EQ(config.symbol().lot_size, 1000);
+}
+
+TEST(ConfigTest, RejectsNonPositiveLotSize) {
+    const auto dir = make_temp_dir("config_bad_lot_size");
+    const auto path = write_config(
+        dir,
+        {
+            {"symbol",
+             {
+                 {"symbol", "7269"},
+                 {"exchange", 9},
+                 {"tick_size", 0.5},
+                 {"max_notional", 500000},
+                 {"lot_size", 0},
+             }},
+        }
+    );
+
     EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
 }

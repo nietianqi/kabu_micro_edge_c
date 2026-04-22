@@ -9,7 +9,9 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repoRoot
 
 $configPath = Join-Path $repoRoot "config.json"
-$binaryPath = Join-Path $repoRoot "build\\Release\\kabu_micro_edge.exe"
+$preferredBinaryPath = Join-Path $repoRoot "cmake-build-release\\Release\\kabu_micro_edge.exe"
+$fallbackBinaryPath = Join-Path $repoRoot "build\\Release\\kabu_micro_edge.exe"
+$binaryPath = if (Test-Path $preferredBinaryPath) { $preferredBinaryPath } else { $fallbackBinaryPath }
 $logsPath = Join-Path $repoRoot "logs"
 $healthLogPath = Join-Path $logsPath "health-check.log"
 
@@ -24,9 +26,10 @@ if (-not (Test-Path $logsPath)) {
 if (-not (Test-Path $binaryPath)) {
     Write-Host "Binary not found. Building project first..." -ForegroundColor Yellow
     powershell -ExecutionPolicy Bypass -File (Join-Path $repoRoot "build.ps1")
-    if (-not (Test-Path $binaryPath)) {
-        throw "Build finished but $binaryPath was not created"
+    if (-not (Test-Path $preferredBinaryPath) -and -not (Test-Path $fallbackBinaryPath)) {
+        throw "Build finished but neither $preferredBinaryPath nor $fallbackBinaryPath was created"
     }
+    $binaryPath = if (Test-Path $preferredBinaryPath) { $preferredBinaryPath } else { $fallbackBinaryPath }
 }
 
 $apiReachable = Test-NetConnection -ComputerName "localhost" -Port 18080 -InformationLevel Quiet -WarningAction SilentlyContinue
@@ -36,8 +39,13 @@ if (-not $apiReachable) {
 }
 
 Write-Host "Starting kabu_micro_edge in live mode..." -ForegroundColor Green
+Write-Host "Using binary: $binaryPath" -ForegroundColor DarkGray
 if ($HealthCheck) {
     Write-Host "Running live health check (token/register/ws/first market data)..." -ForegroundColor Cyan
+} elseif ($RunSeconds -gt 0) {
+    Write-Host "Running real live mode for $RunSeconds seconds..." -ForegroundColor Cyan
+} else {
+    Write-Host "Running real live mode until stopped..." -ForegroundColor Cyan
 }
 
 $arguments = @("--config", $configPath)

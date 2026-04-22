@@ -116,6 +116,39 @@ TEST(ExecutionTest, LiveOpenExplicitDoesNotResendWhileWorkingOrderActive) {
     EXPECT_EQ(controller.working_order->order_id, "OID-ENTRY-1");
 }
 
+TEST(ExecutionTest, LiveEntryRoundsQuantityDownToLotSize) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false,
+        100
+    );
+
+    int sent_qty = 0;
+    controller.set_live_order_callbacks(
+        [&](int, int qty, double, bool) {
+            sent_qty = qty;
+            return std::string("OID-ENTRY-LOT");
+        },
+        [&](int, int, double, bool) { return std::string("OID-EXIT-1"); },
+        [&](const std::string&) {}
+    );
+
+    ASSERT_TRUE(controller.open_explicit(1, 150, 1734.0, make_board(1734.0, 1734.5), "test", false, "maker", 3));
+    ASSERT_TRUE(controller.working_order.has_value());
+    EXPECT_EQ(sent_qty, 100);
+    EXPECT_EQ(controller.working_order->qty, 100);
+}
+
 TEST(ExecutionTest, CloseDoesNotResendWhileCancelPending) {
     const auto config = kabu::config::load_config();
     kabu::execution::ExecutionController controller(
@@ -164,6 +197,136 @@ TEST(ExecutionTest, CloseDoesNotResendWhileCancelPending) {
     EXPECT_FALSE(controller.close(make_board(1734.0, 1734.5), -9.0, "kill_switch_emergency", true, 1734.0));
     EXPECT_EQ(exit_sends, 1);
     EXPECT_EQ(cancel_sends, 1);
+}
+
+TEST(ExecutionTest, CloseDoesNotResendWhenEquivalentExitAlreadyCoversInventory) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    controller.inventory.side = 1;
+    controller.inventory.qty = 100;
+    controller.inventory.avg_price = 1734.0;
+    controller.inventory.opened_ts_ns = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00+09:00");
+    controller.exit_order = kabu::execution::WorkingOrder{
+        "OID-EXIT-COVER",
+        "exit",
+        -1,
+        200,
+        1735.0,
+        false,
+        kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.500000+09:00"),
+        "limit_tp_quote"
+    };
+
+    int exit_sends = 0;
+    controller.set_live_order_callbacks(
+        [&](int, int, double, bool) { return std::string("OID-ENTRY-1"); },
+        [&](int, int, double, bool) {
+            ++exit_sends;
+            return std::string("OID-EXIT-NEW");
+        },
+        [&](const std::string&) {}
+    );
+
+    EXPECT_FALSE(controller.close(make_board(1734.0, 1734.5), 0.0, "limit_tp_quote", false, 1735.0));
+    EXPECT_EQ(exit_sends, 0);
+    ASSERT_TRUE(controller.exit_order.has_value());
+    EXPECT_EQ(controller.exit_order->order_id, "OID-EXIT-COVER");
+    EXPECT_EQ(controller.stats.at("close_attempts"), 0);
+}
+
+TEST(ExecutionTest, CloseErrorCode8WaitsForReconcileInsteadOfImmediateDuplicateResend) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false
+    );
+
+    controller.inventory.side = 1;
+    controller.inventory.qty = 100;
+    controller.inventory.avg_price = 1734.0;
+    controller.inventory.opened_ts_ns = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00+09:00");
+
+    int exit_sends = 0;
+    controller.set_live_order_callbacks(
+        [&](int, int, double, bool) { return std::string("OID-ENTRY-1"); },
+        [&](int, int, double, bool) -> std::string {
+            ++exit_sends;
+            throw kabu::gateway::KabuApiError(
+                "close rejected",
+                500,
+                nlohmann::json{{"Code", 8}, {"Message", "bad close positions"}}
+            );
+        },
+        [&](const std::string&) {}
+    );
+
+    EXPECT_FALSE(controller.close(make_board(1734.0, 1734.5), 0.0, "limit_tp_quote", false, 1735.0));
+    EXPECT_EQ(exit_sends, 1);
+    EXPECT_FALSE(controller.exit_order.has_value());
+    EXPECT_GT(controller.exit_blocked_until_ns, 0);
+
+    EXPECT_FALSE(controller.close(make_board(1734.0, 1734.5), 0.0, "limit_tp_quote", false, 1735.0));
+    EXPECT_EQ(exit_sends, 1);
+}
+
+TEST(ExecutionTest, LiveExitRoundsQuantityDownToLotSize) {
+    const auto config = kabu::config::load_config();
+    kabu::execution::ExecutionController controller(
+        "7269",
+        9,
+        config.order_profile,
+        false,
+        0.5,
+        0.25,
+        0.0,
+        1000,
+        0,
+        30,
+        false,
+        100
+    );
+
+    controller.inventory.side = 1;
+    controller.inventory.qty = 150;
+    controller.inventory.avg_price = 1734.0;
+    controller.inventory.opened_ts_ns = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00+09:00");
+
+    int sent_qty = 0;
+    controller.set_live_order_callbacks(
+        [&](int, int, double, bool) { return std::string("OID-ENTRY-1"); },
+        [&](int, int qty, double, bool) {
+            sent_qty = qty;
+            return std::string("OID-EXIT-LOT");
+        },
+        [&](const std::string&) {}
+    );
+
+    ASSERT_TRUE(controller.close(make_board(1734.0, 1734.5), 0.0, "limit_tp_quote", false, 1735.0));
+    ASSERT_TRUE(controller.exit_order.has_value());
+    EXPECT_EQ(sent_qty, 100);
+    EXPECT_EQ(controller.exit_order->qty, 100);
 }
 
 TEST(ExecutionTest, BrokerSnapshotIsIdempotentForPartialAndFinalFills) {

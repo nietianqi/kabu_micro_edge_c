@@ -60,8 +60,8 @@ class KabuAdapter {
         snapshot.bid_sign = parse_string(raw.value("AskSign", nlohmann::json()), std::string());
         snapshot.ask_sign = parse_string(raw.value("BidSign", nlohmann::json()), std::string());
         snapshot.current_ts_ns = to_ns(raw.value("CurrentPriceTime", nlohmann::json()));
-        snapshot.bid_ts_ns = to_ns(raw.value("BidTime", nlohmann::json()));
-        snapshot.ask_ts_ns = to_ns(raw.value("AskTime", nlohmann::json()));
+        snapshot.bid_ts_ns = to_ns(raw.value("AskTime", nlohmann::json()));
+        snapshot.ask_ts_ns = to_ns(raw.value("BidTime", nlohmann::json()));
         if (snapshot.bid_ts_ns >= snapshot.ask_ts_ns && snapshot.bid_ts_ns >= snapshot.current_ts_ns && snapshot.bid_ts_ns > 0) {
             snapshot.ts_ns = snapshot.bid_ts_ns;
             snapshot.ts_source = "bid_time";
