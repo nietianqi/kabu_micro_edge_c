@@ -39,6 +39,33 @@ kabu::gateway::TradePrint make_trade(std::int64_t ts_ns, double price, int side,
     return {"7269", 9, ts_ns, price, size, side, size};
 }
 
+nlohmann::json make_position(int qty, double price, int closable_qty = -1) {
+    return nlohmann::json{
+        {"HoldID", "HOLD-1"},
+        {"Symbol", "7269"},
+        {"Exchange", 9},
+        {"Side", "2"},
+        {"LeavesQty", qty},
+        {"ClosableQty", closable_qty >= 0 ? closable_qty : qty},
+        {"Price", price},
+        {"MarginTradeType", 1},
+    };
+}
+
+kabu::gateway::OrderSnapshot make_external_order(const std::string& order_id, int side, int qty, double price) {
+    kabu::gateway::OrderSnapshot snapshot;
+    snapshot.order_id = order_id;
+    snapshot.symbol = "7269";
+    snapshot.exchange = 9;
+    snapshot.side = side;
+    snapshot.order_qty = qty;
+    snapshot.cum_qty = 0;
+    snapshot.leaves_qty = qty;
+    snapshot.price = price;
+    snapshot.is_final = false;
+    return snapshot;
+}
+
 kabu::strategy::MicroEdgeStrategy make_strategy(std::shared_ptr<kabu::TradeJournal> journal = nullptr) {
     auto config = kabu::config::load_config();
     config.symbol().symbol = "7269";
@@ -68,6 +95,9 @@ kabu::strategy::MicroEdgeStrategy make_live_strategy(std::shared_ptr<kabu::Trade
     config.symbol().tick_size = 0.5;
     config.symbol().max_notional = 1'000'000;
     config.strategy.trade_volume = 100;
+    config.strategy.max_scale_in_per_round_trip = 2;
+    config.strategy.profit_ticks = 2.0;
+    config.strategy.aggressive_taker_profit_ticks = 2.0;
     config.strategy.entry_order_interval_ms = 0;
     config.strategy.exit_order_interval_ms = 0;
     config.strategy.limit_tp_order_interval_ms = 0;
@@ -159,6 +189,8 @@ TEST(StrategyTest, EntryRoundsDownToConfiguredLotSize) {
     config.strategy.microprice_tilt_long = 0.20;
     config.strategy.confirm_ticks = 1;
     config.strategy.strong_signal_confirm = 1;
+    config.strategy.profit_ticks = 2.0;
+    config.strategy.aggressive_taker_profit_ticks = 2.0;
     config.strategy.entry_order_interval_ms = 0;
     config.strategy.exit_order_interval_ms = 0;
     config.strategy.limit_tp_order_interval_ms = 0;
@@ -209,6 +241,9 @@ TEST(StrategyTest, EntryBelowLotSizeIsBlockedBeforeOrderSubmission) {
     config.strategy.microprice_tilt_long = 0.20;
     config.strategy.confirm_ticks = 1;
     config.strategy.strong_signal_confirm = 1;
+    config.strategy.max_scale_in_per_round_trip = 2;
+    config.strategy.profit_ticks = 2.0;
+    config.strategy.aggressive_taker_profit_ticks = 2.0;
     config.strategy.entry_order_interval_ms = 0;
     config.strategy.exit_order_interval_ms = 0;
     config.strategy.limit_tp_order_interval_ms = 0;
@@ -307,7 +342,29 @@ TEST(StrategyTest, ScaleInRequiresLiveTpWorkflow) {
 }
 
 TEST(StrategyTest, LongInventoryWithManagedTpAllowsScaleIn) {
-    auto strategy = make_strategy();
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 200;
+    config.strategy.max_scale_in_per_round_trip = 2;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.profit_ticks = 2.0;
+    config.strategy.aggressive_taker_profit_ticks = 2.0;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
     strategy.start();
 
     const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
@@ -415,6 +472,8 @@ TEST(StrategyTest, ScaleInPolicyStillAllowsConfiguredThreeLots) {
     config.strategy.microprice_tilt_long = 0.20;
     config.strategy.confirm_ticks = 1;
     config.strategy.strong_signal_confirm = 1;
+    config.strategy.profit_ticks = 2.0;
+    config.strategy.aggressive_taker_profit_ticks = 2.0;
     config.strategy.entry_order_interval_ms = 0;
     config.strategy.exit_order_interval_ms = 0;
     config.strategy.limit_tp_order_interval_ms = 0;
@@ -597,18 +656,7 @@ TEST(StrategyTest, LiveReconcileRecoversExternalInventoryFromBrokerPositions) {
     auto strategy = make_live_strategy();
     strategy.start();
 
-    const std::vector<nlohmann::json> positions{
-        nlohmann::json{
-            {"HoldID", "HOLD-1"},
-            {"Symbol", "7269"},
-            {"Exchange", 9},
-            {"Side", "2"},
-            {"LeavesQty", 200},
-            {"ClosableQty", 200},
-            {"Price", 1734.5},
-            {"MarginTradeType", 1},
-        }
-    };
+    const std::vector<nlohmann::json> positions{make_position(200, 1734.5)};
 
     strategy.reconcile_with_prefetched(
         positions,
@@ -616,11 +664,14 @@ TEST(StrategyTest, LiveReconcileRecoversExternalInventoryFromBrokerPositions) {
         kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00")
     );
 
-    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_EQ(strategy.execution().inventory.qty, 200);
+    EXPECT_EQ(strategy.execution().inventory.side, 1);
+    EXPECT_DOUBLE_EQ(strategy.execution().inventory.avg_price, 1734.5);
     EXPECT_EQ(strategy.execution().broker_hold_qty, 200);
     EXPECT_EQ(strategy.execution().broker_closable_qty, 200);
-    EXPECT_TRUE(strategy.execution().has_external_inventory);
-    EXPECT_TRUE(strategy.execution().has_external_inventory_conflict());
+    EXPECT_TRUE(strategy.execution().has_adopted_external_inventory());
+    EXPECT_FALSE(strategy.execution().has_external_inventory);
+    EXPECT_FALSE(strategy.execution().has_external_inventory_conflict());
     EXPECT_FALSE(strategy.execution().manual_close_lock);
 }
 
@@ -629,21 +680,11 @@ TEST(StrategyTest, LiveReconcileClearsRecoveredExternalInventoryWhenBrokerFlatte
     strategy.start();
 
     const auto ts_ns = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
-    const std::vector<nlohmann::json> positions{
-        nlohmann::json{
-            {"HoldID", "HOLD-1"},
-            {"Symbol", "7269"},
-            {"Exchange", 9},
-            {"Side", "2"},
-            {"LeavesQty", 100},
-            {"ClosableQty", 100},
-            {"Price", 1734.5},
-            {"MarginTradeType", 1},
-        }
-    };
+    const std::vector<nlohmann::json> positions{make_position(100, 1734.5)};
 
     strategy.reconcile_with_prefetched(positions, std::map<std::string, kabu::gateway::OrderSnapshot>{}, ts_ns);
-    ASSERT_TRUE(strategy.execution().has_external_inventory);
+    ASSERT_TRUE(strategy.execution().has_adopted_external_inventory());
+    ASSERT_EQ(strategy.execution().inventory.qty, 100);
 
     strategy.reconcile_with_prefetched(
         std::vector<nlohmann::json>{},
@@ -654,7 +695,113 @@ TEST(StrategyTest, LiveReconcileClearsRecoveredExternalInventoryWhenBrokerFlatte
     EXPECT_FALSE(strategy.execution().has_external_inventory);
     EXPECT_EQ(strategy.execution().broker_hold_qty, 0);
     EXPECT_EQ(strategy.execution().broker_closable_qty, 0);
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
     EXPECT_FALSE(strategy.execution().manual_close_lock);
+}
+
+TEST(StrategyTest, LiveAdoptedInventoryUsesRemainingCapacityForScaleIn) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 300;
+    config.strategy.max_long_inventory = 300;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, false);
+    strategy.start();
+
+    int entry_qty = 0;
+    int exit_sends = 0;
+    strategy.execution().set_live_order_callbacks(
+        [&](int, int qty, double, bool) {
+            entry_qty = qty;
+            return std::string("OID-ENTRY-ADOPT");
+        },
+        [&](int, int, double, bool) {
+            ++exit_sends;
+            return std::string("OID-EXIT-ADOPT");
+        },
+        [&](const std::string&) {}
+    );
+
+    const auto ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    strategy.reconcile_with_prefetched(std::vector<nlohmann::json>{make_position(100, 1734.5)}, std::map<std::string, kabu::gateway::OrderSnapshot>{}, ts);
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    const auto second_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.300000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, second_ts));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_TRUE(strategy.execution().has_adopted_external_inventory());
+    EXPECT_EQ(exit_sends, 1);
+    ASSERT_TRUE(strategy.execution().has_working_entry());
+    EXPECT_EQ(entry_qty, 200);
+    EXPECT_EQ(strategy.execution().working_order->qty, 200);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "entered");
+}
+
+TEST(StrategyTest, LiveAdoptedInventoryCancelsReplaceableExternalExitBeforeManagingLocalTp) {
+    auto strategy = make_live_strategy();
+    strategy.start();
+
+    int exit_sends = 0;
+    std::vector<std::string> canceled_ids;
+    strategy.execution().set_live_order_callbacks(
+        [&](int, int, double, bool) { return std::string("OID-ENTRY-1"); },
+        [&](int, int, double, bool) {
+            ++exit_sends;
+            return std::string("OID-EXIT-LOCAL");
+        },
+        [&](const std::string& order_id) { canceled_ids.push_back(order_id); }
+    );
+
+    auto external_exit = make_external_order("OID-EXTERNAL-EXIT", -1, 100, 1735.0);
+    const auto ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    strategy.reconcile_with_prefetched(
+        std::vector<nlohmann::json>{make_position(100, 1734.5)},
+        std::map<std::string, kabu::gateway::OrderSnapshot>{{external_exit.order_id, external_exit}},
+        ts
+    );
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+
+    ASSERT_EQ(canceled_ids.size(), 1U);
+    EXPECT_EQ(canceled_ids.front(), "OID-EXTERNAL-EXIT");
+    EXPECT_TRUE(strategy.execution().external_exit_replacement_in_progress());
+    EXPECT_TRUE(strategy.execution().has_external_active_orders);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "external_exit_replacement_pending");
+    EXPECT_FALSE(strategy.execution().exit_order.has_value());
+
+    external_exit.is_final = true;
+    external_exit.state_code = 5;
+    external_exit.order_state_code = 5;
+    strategy.reconcile_with_prefetched(
+        std::vector<nlohmann::json>{make_position(100, 1734.5)},
+        std::map<std::string, kabu::gateway::OrderSnapshot>{{external_exit.order_id, external_exit}},
+        ts + 1'000'000
+    );
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts + 1'000'000));
+
+    EXPECT_FALSE(strategy.execution().external_exit_replacement_in_progress());
+    EXPECT_FALSE(strategy.execution().has_external_active_orders);
+    ASSERT_TRUE(strategy.execution().exit_order.has_value());
+    EXPECT_EQ(strategy.execution().exit_order->reason, "limit_tp_quote");
+    EXPECT_EQ(exit_sends, 1);
 }
 
 TEST(StrategyTest, LiveReconcileClearsRecoveredExternalOrdersAfterBrokerFinalizesThem) {

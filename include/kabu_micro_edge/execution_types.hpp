@@ -12,6 +12,7 @@ namespace kabu::execution {
 
 enum class ExecutionState { Flat, Opening, Open, Closing };
 enum class QuoteMode { PassiveFairValue, QueueDefense, CloseOnly };
+enum class InventorySource { Local, ExternalAdopted };
 
 inline std::string to_string(ExecutionState state) {
     switch (state) {
@@ -37,6 +38,16 @@ inline std::string to_string(QuoteMode mode) {
         return "CLOSE_ONLY";
     }
     return "PASSIVE_FAIR_VALUE";
+}
+
+inline std::string to_string(InventorySource source) {
+    switch (source) {
+    case InventorySource::Local:
+        return "local";
+    case InventorySource::ExternalAdopted:
+        return "external_adopted";
+    }
+    return "local";
 }
 
 struct PriceDecision {
@@ -77,6 +88,7 @@ struct Inventory {
     int entry_score{0};
     std::string entry_fill_reason;
     int entry_queue_ahead_qty{0};
+    InventorySource source{InventorySource::Local};
 };
 
 struct RoundTrip {

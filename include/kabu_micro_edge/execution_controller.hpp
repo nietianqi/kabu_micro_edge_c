@@ -85,6 +85,7 @@ class ExecutionController {
     bool manual_close_lock{false};
     bool has_external_inventory{false};
     bool has_external_active_orders{false};
+    bool external_exit_replacement_pending{false};
     int broker_hold_qty{0};
     int broker_closable_qty{0};
     std::vector<std::string> broker_active_order_ids;
@@ -128,9 +129,11 @@ class ExecutionController {
     [[nodiscard]] bool has_working_entry() const { return working_order.has_value(); }
     [[nodiscard]] bool has_working_exit() const { return exit_order.has_value(); }
     [[nodiscard]] bool has_working_orders() const { return has_working_entry() || has_working_exit(); }
+    [[nodiscard]] bool has_adopted_external_inventory() const { return inventory.source == InventorySource::ExternalAdopted; }
     [[nodiscard]] bool has_external_inventory_conflict() const {
         return has_external_inventory || manual_close_lock || has_external_active_orders;
     }
+    [[nodiscard]] bool external_exit_replacement_in_progress() const { return external_exit_replacement_pending; }
     [[nodiscard]] bool managed_tp_exit_is_scale_in_compatible() const {
         if (!exit_order.has_value() || inventory.qty <= 0 || inventory.side <= 0) {
             return false;
@@ -318,6 +321,35 @@ class ExecutionController {
 
     bool cancel_working(const std::string& reason) { return cancel_order(true, reason); }
     bool cancel_exit_order(const std::string& reason) { return cancel_order(false, reason); }
+    bool request_external_exit_replacement() {
+        if (dry_run || replaceable_external_exit_order_ids_.empty()) {
+            return false;
+        }
+        if (!cancel_order_sender_) {
+            throw std::runtime_error("live cancel order sender has not been configured");
+        }
+        bool requested_any = false;
+        const std::set<std::string> active_ids(broker_active_order_ids.begin(), broker_active_order_ids.end());
+        for (const auto& order_id : replaceable_external_exit_order_ids_) {
+            if (!active_ids.contains(order_id) || external_exit_cancel_requested_ids_.contains(order_id)) {
+                continue;
+            }
+            try {
+                cancel_order_sender_(order_id);
+            } catch (const gateway::KabuApiError& error) {
+                const auto code = extract_error_code(error.payload());
+                if (!(error.status() == 500 && code.has_value() && *code == 43)) {
+                    throw;
+                }
+            }
+            external_exit_cancel_requested_ids_.insert(order_id);
+            requested_any = true;
+        }
+        if (!replaceable_external_exit_order_ids_.empty()) {
+            external_exit_replacement_pending = true;
+        }
+        return requested_any;
+    }
 
     bool check_timeout(std::int64_t now_ns) {
         if (!working_order.has_value() || working_order->purpose != "entry") {
@@ -387,11 +419,14 @@ class ExecutionController {
             {"inventory_side", inventory.side},
             {"inventory_qty", inventory.qty},
             {"inventory_price", inventory.avg_price},
+            {"inventory_source", to_string(inventory.source)},
             {"broker_hold_qty", broker_hold_qty},
             {"broker_closable_qty", broker_closable_qty},
             {"manual_close_lock", manual_close_lock},
             {"external_inventory", has_external_inventory},
             {"external_active_orders", has_external_active_orders},
+            {"external_exit_replacement_pending", external_exit_replacement_pending},
+            {"replaceable_external_exit_order_ids", replaceable_external_exit_order_ids_},
             {"has_stranded_partial", has_stranded_partial},
             {"entry_blocked_until_ns", entry_blocked_until_ns},
             {"exit_blocked_until_ns", exit_blocked_until_ns},
@@ -467,10 +502,16 @@ class ExecutionController {
         }
     }
 
-    void sync_broker_position_snapshot(const std::vector<nlohmann::json>& positions, bool force = true) {
+    void sync_broker_position_snapshot(
+        const std::vector<nlohmann::json>& positions,
+        bool force = true,
+        std::int64_t snapshot_ts_ns = 0
+    ) {
         (void)force;
         int long_hold = 0;
         int long_closable = 0;
+        double long_weighted_value = 0.0;
+        int long_priced_qty = 0;
         int short_hold = 0;
         int short_closable = 0;
         for (const auto& raw : positions) {
@@ -481,6 +522,10 @@ class ExecutionController {
             if (lot->side > 0) {
                 long_hold += lot->qty;
                 long_closable += std::max(lot->closable_qty, 0);
+                if (lot->price > 0 && lot->qty > 0) {
+                    long_weighted_value += lot->price * lot->qty;
+                    long_priced_qty += lot->qty;
+                }
             } else if (lot->side < 0) {
                 short_hold += lot->qty;
                 short_closable += std::max(lot->closable_qty, 0);
@@ -498,13 +543,22 @@ class ExecutionController {
             broker_closable_qty = long_closable + short_closable;
         }
 
-        const auto now_ns = wall_clock_ns();
+        const auto now_ns = snapshot_ts_ns > 0 ? snapshot_ts_ns : wall_clock_ns();
         if (inventory.qty == 0) {
+            const bool adoptable_long_inventory =
+                !has_working_orders() && long_hold > 0 && short_hold == 0 && long_priced_qty == long_hold && long_weighted_value > 0.0;
+            if (adoptable_long_inventory) {
+                adopt_external_long_inventory(long_hold, long_weighted_value / long_priced_qty, now_ns);
+                refresh_external_order_state();
+                return;
+            }
             has_external_inventory = broker_hold_qty > 0;
             manual_close_lock = false;
             if (!has_external_inventory) {
                 exit_blocked_until_ns = 0;
             }
+            inventory.source = InventorySource::Local;
+            refresh_external_order_state();
             return;
         }
 
@@ -516,6 +570,7 @@ class ExecutionController {
             broker_hold_qty = 0;
             broker_closable_qty = 0;
             has_stranded_partial = false;
+            refresh_external_order_state();
             return;
         }
 
@@ -557,10 +612,11 @@ class ExecutionController {
         } else if (!has_external_inventory || local_exit_manageable) {
             exit_blocked_until_ns = 0;
         }
+        refresh_external_order_state();
     }
 
     void sync_external_order_snapshots(const std::map<std::string, gateway::OrderSnapshot>& snapshots) {
-        std::vector<std::string> active_ids;
+        broker_external_orders_by_id_.clear();
         const auto local_ids = active_order_ids();
         const std::set<std::string> local_id_set(local_ids.begin(), local_ids.end());
         for (const auto& [order_id, snapshot] : snapshots) {
@@ -570,10 +626,9 @@ class ExecutionController {
             if (snapshot_symbol != symbol || snapshot.is_final || local_id_set.contains(order_id)) {
                 continue;
             }
-            active_ids.push_back(order_id);
+            broker_external_orders_by_id_.emplace(order_id, snapshot);
         }
-        broker_active_order_ids = std::move(active_ids);
-        has_external_active_orders = !broker_active_order_ids.empty();
+        refresh_external_order_state();
     }
 
     [[nodiscard]] std::vector<ConsistencyIssue> consistency_issues() const {
@@ -794,6 +849,79 @@ class ExecutionController {
         return inventory.qty <= 0 || inventory.side == 0 || inventory.side == direction;
     }
 
+    void adopt_external_long_inventory(int qty, double avg_price, std::int64_t now_ns) {
+        inventory.side = 1;
+        inventory.qty = qty;
+        inventory.avg_price = avg_price;
+        inventory.opened_ts_ns = now_ns;
+        inventory.last_entry_fill_ts_ns = now_ns;
+        inventory.entry_qty = qty;
+        inventory.exit_qty = 0;
+        inventory.exit_value = 0.0;
+        inventory.entry_mode = "external_adopted";
+        inventory.entry_score = 0;
+        inventory.entry_fill_reason = "broker_position_adopted";
+        inventory.entry_queue_ahead_qty = 0;
+        inventory.source = InventorySource::ExternalAdopted;
+        has_external_inventory = false;
+        has_stranded_partial = false;
+        manual_close_lock = broker_hold_qty > 0 && broker_closable_qty < qty;
+        if (manual_close_lock) {
+            exit_blocked_until_ns = std::max(exit_blocked_until_ns, now_ns + 15'000'000'000LL);
+        } else {
+            exit_blocked_until_ns = 0;
+        }
+    }
+
+    [[nodiscard]] static int active_broker_order_qty(const gateway::OrderSnapshot& snapshot) {
+        if (snapshot.leaves_qty > 0) {
+            return snapshot.leaves_qty;
+        }
+        return std::max(snapshot.order_qty - snapshot.cum_qty, 0);
+    }
+
+    [[nodiscard]] bool is_replaceable_external_exit(const gateway::OrderSnapshot& snapshot) const {
+        if (!has_adopted_external_inventory() || inventory.side <= 0 || inventory.qty <= 0) {
+            return false;
+        }
+        const int active_qty = active_broker_order_qty(snapshot);
+        return snapshot.side == -inventory.side && active_qty > 0;
+    }
+
+    void refresh_external_order_state() {
+        broker_active_order_ids.clear();
+        replaceable_external_exit_order_ids_.clear();
+        int replaceable_qty = 0;
+        bool all_replaceable = !broker_external_orders_by_id_.empty();
+        for (const auto& [order_id, snapshot] : broker_external_orders_by_id_) {
+            broker_active_order_ids.push_back(order_id);
+            if (is_replaceable_external_exit(snapshot)) {
+                replaceable_external_exit_order_ids_.push_back(order_id);
+                replaceable_qty += active_broker_order_qty(snapshot);
+            } else {
+                all_replaceable = false;
+            }
+        }
+        if (!all_replaceable || replaceable_qty <= 0 || replaceable_qty > broker_closable_qty) {
+            replaceable_external_exit_order_ids_.clear();
+        }
+        has_external_active_orders = !broker_active_order_ids.empty();
+
+        std::set<std::string> active_ids(broker_active_order_ids.begin(), broker_active_order_ids.end());
+        std::set<std::string> replaceable_ids(
+            replaceable_external_exit_order_ids_.begin(),
+            replaceable_external_exit_order_ids_.end()
+        );
+        for (auto it = external_exit_cancel_requested_ids_.begin(); it != external_exit_cancel_requested_ids_.end();) {
+            if (!active_ids.contains(*it) || !replaceable_ids.contains(*it)) {
+                it = external_exit_cancel_requested_ids_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        external_exit_replacement_pending = !replaceable_external_exit_order_ids_.empty();
+    }
+
   public:
     [[nodiscard]] double align_order_price_to_tse_tick(
         double raw_price,
@@ -1007,6 +1135,9 @@ class ExecutionController {
     mutable std::optional<TseTickProfile> tse_tick_profile_;
     int paper_order_counter_{0};
     oms::OrderLedger order_ledger_;
+    std::map<std::string, gateway::OrderSnapshot> broker_external_orders_by_id_;
+    std::vector<std::string> replaceable_external_exit_order_ids_;
+    std::set<std::string> external_exit_cancel_requested_ids_;
     EntryOrderSender entry_order_sender_;
     ExitOrderSender exit_order_sender_;
     CancelOrderSender cancel_order_sender_;

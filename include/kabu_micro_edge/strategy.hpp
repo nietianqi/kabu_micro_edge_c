@@ -160,7 +160,7 @@ class MicroEdgeStrategy {
             }
         }
         if (!dry_run_ && positions.has_value()) {
-            execution_.sync_broker_position_snapshot(*positions, true);
+            execution_.sync_broker_position_snapshot(*positions, true, reconcile_now_ns);
         }
         post_execution_update(reconcile_now_ns);
         enforce_kill_switch(reconcile_now_ns);
@@ -324,6 +324,7 @@ class MicroEdgeStrategy {
         if (!latest_board_.has_value() || !latest_signal_.has_value() || kill_switch_active_) { last_entry_block_reason_ = kill_switch_active_ ? "kill_switch" : last_entry_block_reason_; return; }
         std::string market_reason; if (!validate_market_quality(now_ns, market_reason)) { last_entry_block_reason_ = market_reason; long_confirm_ = 0; return; }
         if (execution_.has_working_entry()) { last_entry_block_reason_ = "working_order"; return; }
+        if (execution_.external_exit_replacement_in_progress()) { last_entry_block_reason_ = "external_exit_replacement_pending"; return; }
         if (execution_.has_conflicting_opposite_order()) { last_entry_block_reason_ = "conflicting_opposite_order"; return; }
         if (execution_.inventory.qty > 0 && !can_scale_in_with_live_tp()) { last_entry_block_reason_ = "scale_in_blocked"; return; }
         const auto risk_gate = risk_.can_enter(now_ns); if (!risk_gate.first) { last_entry_block_reason_ = risk_gate.second; return; }
@@ -358,6 +359,8 @@ class MicroEdgeStrategy {
     void handle_exit(std::int64_t now_ns) {
         if (!latest_board_.has_value() || !latest_signal_.has_value() || execution_.inventory.qty <= 0) return;
         if (kill_switch_active_ && kill_switch_hard_close_) return enforce_kill_switch(now_ns);
+        execution_.request_external_exit_replacement();
+        if (execution_.external_exit_replacement_in_progress()) return;
         if (!execution_.can_manage_local_exit()) return;
         if (execution_.has_stranded_partial && allow_exit_order(now_ns)) { execution_.close(*latest_board_, -9.0, "stranded_partial_exit", true, latest_board_->bid); last_exit_order_action_ns_ = now_ns; return; }
         if (tp_retry_exit_required_ && allow_exit_order(now_ns)) { execution_.close(*latest_board_, -2.0, "tp_retry_exhausted_exit", true, latest_board_->bid); last_exit_order_action_ns_ = now_ns; return; }
