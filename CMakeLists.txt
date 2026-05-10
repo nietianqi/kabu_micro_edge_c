@@ -87,6 +87,7 @@ if(BUILD_TESTING)
   add_executable(
     kabu_micro_edge_tests
     tests/test_config.cpp
+    tests/test_diagnostics.cpp
     tests/test_execution.cpp
     tests/test_gateway.cpp
     tests/test_journal.cpp

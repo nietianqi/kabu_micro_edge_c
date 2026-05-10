@@ -21,6 +21,16 @@
   "shutdown_emergency_timeout_s": 5.0,
   "startup_retry_count": 3,
   "startup_retry_delay_s": 2.0,
+  "live_safety": {
+    "enabled": true,
+    "rest_error_cooldown_seconds": 5.0,
+    "max_consecutive_rest_errors": 3,
+    "hard_kill_on_max_consecutive_rest_errors": true
+  },
+  "diagnostics": {
+    "jsonl_path": "logs/diagnostics.jsonl",
+    "heartbeat_interval_s": 15
+  },
   "order_profile": {
     "mode": "margin",
     "allow_short": false,
@@ -117,6 +127,9 @@
     "market_open": "09:00",
     "market_close": "15:30",
     "lunch_break_start": "11:30",
-    "lunch_break_end": "12:30"
+    "lunch_break_end": "12:30",
+    "enforce_session_gate": true,
+    "allow_entries_during_lunch_break": false,
+    "entry_cutoff_seconds_before_close": 0
   }
 }

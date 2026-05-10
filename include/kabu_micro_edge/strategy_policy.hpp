@@ -233,4 +233,57 @@ inline EntryDecision evaluate_long_signal(
     return {true, "", entry_mode, entry_score, std::max(required_confirm, 1)};
 }
 
+struct ExecutionQualityScore {
+    int spread_score{0};      // 0-3: tighter spread = higher score
+    int imbalance_score{0};   // 0-3: stronger imbalance = higher score
+    int ofi_score{0};         // 0-2: LOB-OFI + Tape-OFI alignment
+    int microprice_score{0};  // 0-2: microprice tilt strength
+
+    [[nodiscard]] int total() const {
+        return spread_score + imbalance_score + ofi_score + microprice_score;
+    }
+
+    [[nodiscard]] nlohmann::json to_json() const {
+        return {
+            {"spread_score", spread_score},
+            {"imbalance_score", imbalance_score},
+            {"ofi_score", ofi_score},
+            {"microprice_score", microprice_score},
+            {"total", total()},
+        };
+    }
+};
+
+inline ExecutionQualityScore compute_execution_quality(
+    const gateway::BoardSnapshot& snapshot,
+    const signals::SignalPacket& signal,
+    const config::StrategyConfig& cfg,
+    double tick_size
+) {
+    ExecutionQualityScore score;
+    const double tick = std::max(tick_size, 1e-9);
+
+    // Spread score (0-3): tighter = better
+    const double spread_ticks = snapshot.spread() / tick;
+    if (spread_ticks <= cfg.min_spread_ticks)             score.spread_score = 3;
+    else if (spread_ticks <= cfg.min_spread_ticks + 1.0) score.spread_score = 2;
+    else if (spread_ticks <= cfg.min_spread_ticks + 2.0) score.spread_score = 1;
+
+    // Imbalance score (0-3): stronger imbalance = better
+    if (signal.obi_raw >= cfg.book_imbalance_long * 1.5)       score.imbalance_score = 3;
+    else if (signal.obi_raw >= cfg.book_imbalance_long * 1.25) score.imbalance_score = 2;
+    else if (signal.obi_raw >= cfg.book_imbalance_long)        score.imbalance_score = 1;
+
+    // OFI score (0-2): both LOB-OFI and Tape-OFI aligned = 2
+    const bool lob_ok  = signal.lob_ofi_raw  >= cfg.of_imbalance_long;
+    const bool tape_ok = signal.tape_ofi_raw >= cfg.tape_imbalance_long;
+    score.ofi_score = (lob_ok && tape_ok) ? 2 : (lob_ok || tape_ok) ? 1 : 0;
+
+    // Microprice score (0-2): stronger tilt = better
+    if (signal.microprice_tilt_raw >= cfg.microprice_tilt_long * 1.5) score.microprice_score = 2;
+    else if (signal.microprice_tilt_raw >= cfg.microprice_tilt_long)  score.microprice_score = 1;
+
+    return score;
+}
+
 }  // namespace kabu::strategy

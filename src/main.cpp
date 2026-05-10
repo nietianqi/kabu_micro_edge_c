@@ -18,6 +18,7 @@
 
 #include "kabu_micro_edge/app.hpp"
 #include "kabu_micro_edge/config.hpp"
+#include "kabu_micro_edge/diagnostics.hpp"
 #include "kabu_micro_edge/live_rest_executor.hpp"
 #include "kabu_micro_edge/strategy.hpp"
 
@@ -215,6 +216,13 @@ int main(int argc, char** argv) {
 
         std::vector<std::shared_ptr<kabu::TradeJournal>> journals;
         std::vector<std::shared_ptr<kabu::strategy::MicroEdgeStrategy>> strategies;
+        std::shared_ptr<kabu::telemetry::JsonlDiagnosticsWriter> diagnostics_writer;
+        if (!config.diagnostics.jsonl_path.empty()) {
+            diagnostics_writer = std::make_shared<kabu::telemetry::JsonlDiagnosticsWriter>(
+                config.diagnostics.jsonl_path
+            );
+            diagnostics_writer->open();
+        }
         journals.reserve(config.symbols.size());
         strategies.reserve(config.symbols.size());
         for (const auto& symbol : config.symbols) {
@@ -234,6 +242,12 @@ int main(int argc, char** argv) {
                 strategy_dry_run,
                 journal,
                 app.make_account_entry_guard(),
+                diagnostics_writer
+                    ? kabu::strategy::MicroEdgeStrategy::DecisionTraceSink{
+                          [diagnostics_writer, symbol_key = symbol.symbol + "@" + std::to_string(symbol.exchange)](
+                              const kabu::strategy::DecisionTrace& trace
+                          ) { diagnostics_writer->write_decision(symbol_key, trace); }}
+                    : kabu::strategy::MicroEdgeStrategy::DecisionTraceSink{},
                 config.event_queue_maxsize
             );
             if (!config.dry_run && !health_check) {
@@ -316,6 +330,11 @@ int main(int argc, char** argv) {
         const auto start = std::chrono::steady_clock::now();
         auto next_tick = start;
         auto next_status = start + std::chrono::seconds(config.status_interval_s);
+        auto next_diagnostics = start + std::chrono::seconds(config.diagnostics.heartbeat_interval_s);
+
+        if (diagnostics_writer) {
+            diagnostics_writer->write_heartbeat(app.status_snapshot(), now_ns());
+        }
 
         while (g_keep_running.load()) {
             const auto loop_now = std::chrono::steady_clock::now();
@@ -345,6 +364,10 @@ int main(int argc, char** argv) {
                 std::cout << app.status_snapshot().dump() << "\n";
                 next_status = loop_now + std::chrono::seconds(config.status_interval_s);
             }
+            if (diagnostics_writer && loop_now >= next_diagnostics) {
+                diagnostics_writer->write_heartbeat(app.status_snapshot(), timestamp_ns);
+                next_diagnostics = loop_now + std::chrono::seconds(config.diagnostics.heartbeat_interval_s);
+            }
 
             if (run_seconds.has_value()) {
                 const auto elapsed_s = std::chrono::duration<double>(loop_now - start).count();
@@ -371,6 +394,10 @@ int main(int argc, char** argv) {
         }
         app.rest().stop();
         app.set_running(false);
+        if (diagnostics_writer) {
+            diagnostics_writer->write_heartbeat(app.status_snapshot(), now_ns());
+            diagnostics_writer->close();
+        }
 
         std::cout << std::setw(2) << build_payload(config, app, true, false) << "\n";
         if (health_check && !received_market_data.load(std::memory_order_relaxed)) {

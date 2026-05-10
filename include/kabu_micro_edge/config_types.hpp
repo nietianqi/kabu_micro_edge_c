@@ -54,6 +54,18 @@ struct AccountRiskConfig {
     double max_total_notional{0.0};
 };
 
+struct LiveSafetyConfig {
+    bool enabled{true};
+    double rest_error_cooldown_seconds{5.0};
+    int max_consecutive_rest_errors{3};
+    bool hard_kill_on_max_consecutive_rest_errors{true};
+};
+
+struct DiagnosticsConfig {
+    std::string jsonl_path;
+    int heartbeat_interval_s{15};
+};
+
 struct SymbolConfig {
     std::string symbol;
     int exchange{1};
@@ -137,7 +149,30 @@ struct StrategyConfig {
     std::string market_close{"15:30"};
     std::string lunch_break_start{"11:30"};
     std::string lunch_break_end{"12:30"};
+    bool enforce_session_gate{true};
+    bool allow_entries_during_lunch_break{false};
+    int entry_cutoff_seconds_before_close{0};
     double commission_per_share{0.0};
+
+    // Jump detection
+    bool   enable_jump_filter{true};
+    double jump_gap_seconds{0.5};
+    double jump_mid_ticks{3.0};
+    int    jump_cooldown_ms{500};
+
+    // Execution quality gate
+    bool enable_exec_quality_gate{false};
+    int  min_exec_quality_score{5};
+
+    // Near-miss tracker
+    bool track_near_misses{true};
+    int  near_miss_min_score{9};
+
+    // Dynamic position sizing
+    bool   scale_qty_by_score{false};
+    int    scale_qty_score_threshold{10};
+    double scale_qty_multiplier{1.5};
+    int    scale_qty_max_volume{0};
 
     [[nodiscard]] std::pair<int, int> market_open_hm() const { return parse_hhmm(market_open, "market_open"); }
     [[nodiscard]] std::pair<int, int> market_close_hm() const { return parse_hhmm(market_close, "market_close"); }
@@ -186,6 +221,8 @@ struct AppConfig {
     double startup_retry_delay_s{2.0};
     OrderProfile order_profile;
     AccountRiskConfig account_risk;
+    LiveSafetyConfig live_safety;
+    DiagnosticsConfig diagnostics;
     std::vector<SymbolConfig> symbols;
     StrategyConfig strategy;
 

@@ -11,6 +11,7 @@
 #include <sstream>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -18,6 +19,7 @@
 
 #include "kabu_micro_edge/config.hpp"
 #include "kabu_micro_edge/gateway.hpp"
+#include "kabu_micro_edge/live_safety.hpp"
 #include "kabu_micro_edge/risk.hpp"
 #include "kabu_micro_edge/strategy.hpp"
 
@@ -104,7 +106,8 @@ class MicroEdgeApp {
               config_.order_rate_limit_per_second,
               config_.poll_rate_limit_per_second
           ),
-          account_risk_(config_.account_risk) {}
+          account_risk_(config_.account_risk),
+          live_safety_(config_.live_safety, !config_.dry_run) {}
 
     void set_strategy(std::shared_ptr<strategy::MicroEdgeStrategy> strategy_ptr) {
         register_strategy(config_.symbol(), std::move(strategy_ptr));
@@ -176,6 +179,7 @@ class MicroEdgeApp {
         for (int attempt = 0; attempt <= max_retries; ++attempt) {
             try {
                 rest_.get_token(config_.api_password);
+                note_rest_success();
                 break;
             } catch (...) {
                 if (attempt >= max_retries) {
@@ -189,6 +193,7 @@ class MicroEdgeApp {
         for (int attempt = 0; attempt <= max_retries; ++attempt) {
             try {
                 register_symbols();
+                note_rest_success();
                 break;
             } catch (...) {
                 note_rest_error("startup register_symbols failed");
@@ -205,6 +210,7 @@ class MicroEdgeApp {
     void reregister_symbols() {
         try {
             register_symbols();
+            note_rest_success();
         } catch (const gateway::KabuApiError& error) {
             if (error.status() != 401 && error.status() != 403) {
                 note_rest_error(format_gateway_error(error, "register_symbols failed"));
@@ -213,13 +219,22 @@ class MicroEdgeApp {
             rest_.get_token(config_.api_password);
             ++token_refresh_count_;
             register_symbols();
+            note_rest_success();
         }
     }
 
     template <typename Fn>
     decltype(auto) with_authorization_retry(Fn&& fn) {
         try {
-            return fn();
+            if constexpr (std::is_void_v<std::invoke_result_t<Fn>>) {
+                fn();
+                note_rest_success();
+                return;
+            } else {
+                auto result = fn();
+                note_rest_success();
+                return result;
+            }
         } catch (const gateway::KabuApiError& error) {
             if (error.status() != 401 && error.status() != 403) {
                 note_rest_error(format_gateway_error(error));
@@ -228,7 +243,15 @@ class MicroEdgeApp {
             rest_.get_token(config_.api_password);
             ++token_refresh_count_;
             register_symbols();
-            return fn();
+            if constexpr (std::is_void_v<std::invoke_result_t<Fn>>) {
+                fn();
+                note_rest_success();
+                return;
+            } else {
+                auto result = fn();
+                note_rest_success();
+                return result;
+            }
         }
     }
 
@@ -278,7 +301,15 @@ class MicroEdgeApp {
         return stream.str();
     }
 
-    void note_rest_error(std::string message) { last_rest_error_ = std::move(message); }
+    void note_rest_error(std::string message) {
+        last_rest_error_ = std::move(message);
+        live_safety_.note_rest_error(wall_clock_ns(), last_rest_error_);
+        if (live_safety_.should_activate_kill_switch()) {
+            activate_kill_switch("live_safety_rest_error_streak", true);
+            live_safety_.clear_kill_switch_request();
+        }
+    }
+    void note_rest_success() { live_safety_.note_rest_success(); }
     void note_websocket_error(std::string message) { last_websocket_error_ = std::move(message); }
     void note_reconcile_failure(std::string message) {
         ++reconcile_failure_count_;
@@ -355,6 +386,10 @@ class MicroEdgeApp {
     [[nodiscard]] std::pair<bool, std::string> can_enter_account(int additional_qty = 0, double additional_price = 0.0) {
         if (recovery_in_progress_) {
             return {false, recovery_reason_.empty() ? "recovery_in_progress" : recovery_reason_};
+        }
+        const auto live_safety_gate = live_safety_.can_enter(wall_clock_ns());
+        if (!live_safety_gate.first) {
+            return live_safety_gate;
         }
         const auto snapshot = account_risk_snapshot(additional_qty, additional_price);
         return {!snapshot.entry_blocked, snapshot.block_reason};
@@ -545,6 +580,7 @@ class MicroEdgeApp {
             {"last_reconcile_error", last_reconcile_error_},
             {"consistency_ok", total_consistency_issue_count == 0},
             {"consistency_issue_count", total_consistency_issue_count},
+            {"live_safety", live_safety_.snapshot(wall_clock_ns())},
             {"account_risk", account_risk_snapshot()},
             {"strategies", strategies},
         };
@@ -644,6 +680,7 @@ class MicroEdgeApp {
     config::AppConfig config_;
     gateway::KabuRestClient rest_;
     risk::AccountRiskController account_risk_;
+    LiveSafetyController live_safety_;
     std::map<std::pair<std::string, int>, StrategyRuntime> strategy_runtimes_;
     std::map<std::pair<std::string, int>, std::pair<std::string, int>> strategy_routes_;
     std::function<nlohmann::json()> websocket_status_provider_;

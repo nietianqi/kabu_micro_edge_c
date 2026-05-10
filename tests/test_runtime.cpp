@@ -150,6 +150,43 @@ TEST(RuntimeTest, AccountEntryGuardBlocksWhileRecoveryIsInProgress) {
     EXPECT_EQ(status.at("recovery_reason").get<std::string>(), "startup_recovery");
 }
 
+TEST(RuntimeTest, LiveSafetyBackoffBlocksNewEntriesAfterRestError) {
+    auto config = kabu::config::load_config();
+    config.dry_run = false;
+    config.live_safety.rest_error_cooldown_seconds = 10.0;
+    auto strategy = make_strategy(config, "7269", 9);
+
+    kabu::app::MicroEdgeApp app(config);
+    app.set_strategy(strategy);
+    app.note_rest_error("temporary_gateway_failure");
+
+    const auto guard = app.make_account_entry_guard();
+    const auto [allowed, reason] = guard(100, 1735.0);
+
+    EXPECT_FALSE(allowed);
+    EXPECT_EQ(reason, "live_safety_api_backoff");
+    const auto status = app.status_snapshot();
+    EXPECT_TRUE(status.at("live_safety").at("entry_blocked").get<bool>());
+    EXPECT_EQ(status.at("live_safety").at("consecutive_rest_errors").get<int>(), 1);
+}
+
+TEST(RuntimeTest, LiveSafetyEscalatesKillSwitchAfterConfiguredErrorStreak) {
+    auto config = kabu::config::load_config();
+    config.dry_run = false;
+    config.live_safety.max_consecutive_rest_errors = 2;
+    auto strategy = make_strategy(config, "7269", 9);
+
+    kabu::app::MicroEdgeApp app(config);
+    app.set_strategy(strategy);
+    app.note_rest_error("one");
+    EXPECT_FALSE(app.kill_switch_active());
+
+    app.note_rest_error("two");
+
+    EXPECT_TRUE(app.kill_switch_active());
+    EXPECT_EQ(app.kill_switch_reason(), "live_safety_rest_error_streak");
+}
+
 TEST(RuntimeTest, RecoveryStateTransitionsFromStartupToReady) {
     auto config = kabu::config::load_config();
     auto strategy = make_strategy(config, "7269", 9);

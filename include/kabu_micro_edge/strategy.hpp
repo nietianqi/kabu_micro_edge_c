@@ -21,9 +21,91 @@
 
 namespace kabu::strategy {
 
+enum class SessionPhase {
+    Startup,
+    PreOpen,
+    Trading,
+    LunchBreak,
+    EntryCutoff,
+    Closed,
+};
+
+inline std::string to_string(SessionPhase phase) {
+    switch (phase) {
+    case SessionPhase::Startup:
+        return "startup";
+    case SessionPhase::PreOpen:
+        return "pre_open";
+    case SessionPhase::Trading:
+        return "trading";
+    case SessionPhase::LunchBreak:
+        return "lunch_break";
+    case SessionPhase::EntryCutoff:
+        return "entry_cutoff";
+    case SessionPhase::Closed:
+        return "closed";
+    }
+    return "startup";
+}
+
+struct SessionGateState {
+    SessionPhase phase{SessionPhase::Startup};
+    bool observe_allowed{true};
+    bool entry_allowed{false};
+    std::string block_reason{"startup"};
+
+    [[nodiscard]] nlohmann::json to_json() const {
+        return {
+            {"phase", to_string(phase)},
+            {"observe_allowed", observe_allowed},
+            {"entry_allowed", entry_allowed},
+            {"block_reason", block_reason},
+        };
+    }
+};
+
+struct DecisionTrace {
+    std::int64_t ts_ns{0};
+    std::string stage{"startup"};
+    std::string session_phase{"startup"};
+    bool allow{false};
+    std::string reason{"startup"};
+    std::string entry_mode;
+    int entry_score{0};
+    int required_confirm{0};
+    bool market_ok{false};
+    std::string market_reason{"startup"};
+    bool local_risk_ok{true};
+    bool account_guard_ok{true};
+    std::string account_guard_reason;
+    int confirm_progress{0};
+    EntryLayerDiagnostics layers;
+
+    [[nodiscard]] nlohmann::json to_json() const {
+        return {
+            {"ts_ns", ts_ns},
+            {"stage", stage},
+            {"session_phase", session_phase},
+            {"allow", allow},
+            {"reason", reason},
+            {"entry_mode", entry_mode},
+            {"entry_score", entry_score},
+            {"required_confirm", required_confirm},
+            {"market_ok", market_ok},
+            {"market_reason", market_reason},
+            {"local_risk_ok", local_risk_ok},
+            {"account_guard_ok", account_guard_ok},
+            {"account_guard_reason", account_guard_reason},
+            {"confirm_progress", confirm_progress},
+            {"layers", layers.to_json()},
+        };
+    }
+};
+
 class MicroEdgeStrategy {
   public:
     using EntryGuard = std::function<std::pair<bool, std::string>(int, double)>;
+    using DecisionTraceSink = std::function<void(const DecisionTrace&)>;
     struct RuntimeMetrics {
         int queue_depth{0};
         int queue_maxsize{0};
@@ -48,6 +130,7 @@ class MicroEdgeStrategy {
         bool dry_run = true,
         std::shared_ptr<TradeJournal> journal = nullptr,
         EntryGuard entry_guard = {},
+        DecisionTraceSink decision_trace_sink = {},
         int event_queue_maxsize = 512
     )
         : symbol_config_(std::move(symbol)),
@@ -56,6 +139,7 @@ class MicroEdgeStrategy {
           dry_run_(dry_run),
           journal_(journal),
           entry_guard_(std::move(entry_guard)),
+          decision_trace_sink_(std::move(decision_trace_sink)),
           event_queue_maxsize_(std::max(event_queue_maxsize, 1)),
           execution_(
               symbol_config_.symbol,
@@ -94,6 +178,20 @@ class MicroEdgeStrategy {
     void process_board(const gateway::BoardSnapshot& snapshot) {
         if (!started_) return;
         latest_board_ = signal_engine_.sanitize_snapshot(snapshot);
+        // Jump detection: large time gap + large mid move → block entries briefly
+        if (config_.enable_jump_filter && latest_board_.has_value() && latest_board_->event_gap_ns > 0) {
+            const double gap_s = static_cast<double>(latest_board_->event_gap_ns) / 1e9;
+            if (gap_s > config_.jump_gap_seconds && pre_gap_mid_ > 0.0) {
+                const double tick = execution_.get_tse_order_tick(latest_board_->mid());
+                const double mid_move = std::abs(latest_board_->mid() - pre_gap_mid_) / std::max(tick, 1e-9);
+                if (mid_move > config_.jump_mid_ticks) {
+                    last_jump_detected_ns_ = latest_board_->ts_ns;
+                }
+            }
+        }
+        if (latest_board_.has_value() && !latest_board_->out_of_order) {
+            pre_gap_mid_ = latest_board_->mid();
+        }
         latest_signal_ = signal_engine_.on_board(*latest_board_);
         latest_entry_score_ = compute_entry_score();
         latest_taker_breakout_ready_ = latest_board_.has_value() && latest_signal_.has_value()
@@ -183,6 +281,7 @@ class MicroEdgeStrategy {
     [[nodiscard]] const risk::RiskController& risk() const { return risk_; }
     [[nodiscard]] const config::SymbolConfig& symbol_config() const { return symbol_config_; }
     [[nodiscard]] const std::optional<gateway::BoardSnapshot>& latest_board() const { return latest_board_; }
+    [[nodiscard]] const DecisionTrace& last_entry_decision() const { return last_entry_decision_; }
     [[nodiscard]] RuntimeMetrics runtime_metrics() const {
         return {
             0,
@@ -204,6 +303,7 @@ class MicroEdgeStrategy {
 
     [[nodiscard]] nlohmann::json status() {
         const auto risk_snapshot = risk_.snapshot(latest_signal_.has_value() ? latest_signal_->ts_ns : 0);
+        const auto session_gate = current_session_gate(reference_now_ns());
         const auto layers =
             latest_board_.has_value() && latest_signal_.has_value()
                 ? entry_layer_diagnostics(*latest_board_, *latest_signal_, config_).to_json()
@@ -241,6 +341,12 @@ class MicroEdgeStrategy {
                  {"entry_score", latest_entry_score_},
                  {"taker_breakout_ready", latest_taker_breakout_ready_},
                  {"entry_layers", layers},
+                 {"decision_trace", last_entry_decision_.to_json()},
+                 {"exec_quality", [&]() -> nlohmann::json {
+                     if (!latest_board_.has_value() || !latest_signal_.has_value()) return nlohmann::json::object();
+                     const double tick = execution_.get_tse_order_tick(latest_board_->mid());
+                     return compute_execution_quality(*latest_board_, *latest_signal_, config_, tick).to_json();
+                 }()},
              }},
             {"risk",
              {
@@ -255,6 +361,9 @@ class MicroEdgeStrategy {
                  {"kill_switch_active", kill_switch_active_},
                  {"kill_switch_reason", kill_switch_reason_},
                  {"kill_switch_hard_close", kill_switch_hard_close_},
+                 {"session_phase", to_string(session_gate.phase)},
+                 {"session_entry_allowed", session_gate.entry_allowed},
+                 {"session_entry_block_reason", session_gate.block_reason},
              }},
             {"execution", execution_json},
             {"runtime",
@@ -290,6 +399,11 @@ class MicroEdgeStrategy {
                       {"unknown_fills", entry_fill_counts_.at("unknown")},
                   }},
                  {"tp", {{"touch_count", tp_touch_count_}, {"fill_count", tp_fill_count_}}},
+                 {"near_miss", {
+                     {"count", near_miss_count_},
+                     {"last_ts_ns", last_near_miss_ts_ns_},
+                     {"last_reason", last_near_miss_reason_},
+                 }},
                  {"markout", journal_ != nullptr ? journal_->snapshot() : nlohmann::json{{"trade_count", 0}, {"pending_markouts", 0}, {"pending_post_exit_markouts", 0}, {"pending_entry_markouts", 0}, {"markout_horizons", nlohmann::json::object()}, {"post_exit_horizons", nlohmann::json::object()}, {"entry_horizons", nlohmann::json::object()}}},
              }},
         };
@@ -307,6 +421,90 @@ class MicroEdgeStrategy {
                round_scale_in_count_ < config_.max_scale_in_per_round_trip;
     }
 
+    [[nodiscard]] std::int64_t reference_now_ns() const {
+        if (latest_board_.has_value() && latest_board_->ts_ns > 0) {
+            return latest_board_->ts_ns;
+        }
+        if (latest_signal_.has_value() && latest_signal_->ts_ns > 0) {
+            return latest_signal_->ts_ns;
+        }
+        return last_trade_ts_ns_;
+    }
+
+    [[nodiscard]] SessionGateState current_session_gate(std::int64_t now_ns) const {
+        if (!config_.enforce_session_gate) {
+            return {SessionPhase::Trading, true, true, ""};
+        }
+        if (now_ns <= 0) {
+            return {};
+        }
+
+        const int now_seconds = common::jst_seconds_of_day(now_ns);
+        const auto [open_hour, open_minute] = config_.market_open_hm();
+        const auto [close_hour, close_minute] = config_.market_close_hm();
+        const auto [lunch_start_hour, lunch_start_minute] = config_.lunch_break_start_hm();
+        const auto [lunch_end_hour, lunch_end_minute] = config_.lunch_break_end_hm();
+        const int market_open_seconds = open_hour * 3600 + open_minute * 60;
+        const int market_close_seconds = close_hour * 3600 + close_minute * 60;
+        const int lunch_start_seconds = lunch_start_hour * 3600 + lunch_start_minute * 60;
+        const int lunch_end_seconds = lunch_end_hour * 3600 + lunch_end_minute * 60;
+        const int cutoff_seconds =
+            std::max(market_open_seconds, market_close_seconds - config_.entry_cutoff_seconds_before_close);
+
+        if (now_seconds < market_open_seconds) {
+            return {SessionPhase::PreOpen, true, false, "session_pre_open"};
+        }
+        if (now_seconds >= market_close_seconds) {
+            return {SessionPhase::Closed, true, false, "session_closed"};
+        }
+        if (!config_.allow_entries_during_lunch_break &&
+            now_seconds >= lunch_start_seconds && now_seconds < lunch_end_seconds) {
+            return {SessionPhase::LunchBreak, true, false, "session_lunch_break"};
+        }
+        if (config_.entry_cutoff_seconds_before_close > 0 && now_seconds >= cutoff_seconds) {
+            return {SessionPhase::EntryCutoff, true, false, "session_entry_cutoff"};
+        }
+        return {SessionPhase::Trading, true, true, ""};
+    }
+
+    void publish_entry_decision(
+        std::int64_t now_ns,
+        std::string stage,
+        bool allow,
+        std::string reason,
+        const std::optional<EntryDecision>& policy_decision = std::nullopt,
+        bool market_ok = false,
+        std::string market_reason = {},
+        bool local_risk_ok = true,
+        bool account_guard_ok = true,
+        std::string account_guard_reason = {},
+        int confirm_progress = 0
+    ) {
+        const auto session_gate = current_session_gate(now_ns);
+        last_entry_decision_ = {
+            now_ns,
+            std::move(stage),
+            to_string(session_gate.phase),
+            allow,
+            std::move(reason),
+            policy_decision.has_value() ? policy_decision->entry_mode : std::string(),
+            policy_decision.has_value() ? policy_decision->entry_score : latest_entry_score_,
+            policy_decision.has_value() ? policy_decision->required_confirm : 0,
+            market_ok,
+            std::move(market_reason),
+            local_risk_ok,
+            account_guard_ok,
+            std::move(account_guard_reason),
+            confirm_progress,
+            latest_board_.has_value() && latest_signal_.has_value()
+                ? entry_layer_diagnostics(*latest_board_, *latest_signal_, config_)
+                : EntryLayerDiagnostics{},
+        };
+        if (decision_trace_sink_) {
+            decision_trace_sink_(last_entry_decision_);
+        }
+    }
+
     bool validate_market_quality(std::int64_t now_ns, std::string& reason) const {
         if (!latest_board_.has_value() || !latest_signal_.has_value()) { reason = "startup"; return false; }
         const auto& board = *latest_board_;
@@ -317,43 +515,193 @@ class MicroEdgeStrategy {
         if (board.ts_ns > 0 && now_ns - board.ts_ns > static_cast<std::int64_t>(config_.max_tick_stale_seconds * 1e9)) { reason = "stale"; return false; }
         const double spread_ticks = board.spread() / std::max(execution_.get_tse_order_tick(board.mid()), 1e-9);
         if (spread_ticks < config_.min_spread_ticks || spread_ticks > config_.max_spread_ticks) { reason = "spread"; return false; }
+        if (config_.enable_jump_filter && last_jump_detected_ns_ > 0) {
+            const auto cooldown_ns = static_cast<std::int64_t>(config_.jump_cooldown_ms) * 1'000'000LL;
+            if (now_ns - last_jump_detected_ns_ < cooldown_ns) { reason = "jump_cooldown"; return false; }
+        }
         reason.clear(); return true;
     }
 
     void handle_entry(std::int64_t now_ns) {
-        if (!latest_board_.has_value() || !latest_signal_.has_value() || kill_switch_active_) { last_entry_block_reason_ = kill_switch_active_ ? "kill_switch" : last_entry_block_reason_; return; }
-        std::string market_reason; if (!validate_market_quality(now_ns, market_reason)) { last_entry_block_reason_ = market_reason; long_confirm_ = 0; return; }
-        if (execution_.has_working_entry()) { last_entry_block_reason_ = "working_order"; return; }
-        if (execution_.external_exit_replacement_in_progress()) { last_entry_block_reason_ = "external_exit_replacement_pending"; return; }
-        if (execution_.has_conflicting_opposite_order()) { last_entry_block_reason_ = "conflicting_opposite_order"; return; }
-        if (execution_.inventory.qty > 0 && !can_scale_in_with_live_tp()) { last_entry_block_reason_ = "scale_in_blocked"; return; }
-        const auto risk_gate = risk_.can_enter(now_ns); if (!risk_gate.first) { last_entry_block_reason_ = risk_gate.second; return; }
-        const auto decision = evaluate_long_signal(*latest_board_, *latest_signal_, config_); if (!decision.allow) { last_entry_block_reason_ = decision.reason; long_confirm_ = 0; return; }
-        int order_qty = std::min(config_.trade_volume, std::max(config_.max_long_inventory - execution_.inventory.qty, 0));
+        if (!latest_board_.has_value() || !latest_signal_.has_value()) {
+            publish_entry_decision(now_ns, "startup", false, last_entry_block_reason_, std::nullopt, false, "startup");
+            return;
+        }
+        if (kill_switch_active_) {
+            last_entry_block_reason_ = "kill_switch";
+            publish_entry_decision(now_ns, "kill_switch", false, last_entry_block_reason_);
+            return;
+        }
+
+        const auto session_gate = current_session_gate(now_ns);
+        if (!session_gate.entry_allowed) {
+            last_entry_block_reason_ = session_gate.block_reason;
+            long_confirm_ = 0;
+            publish_entry_decision(now_ns, "session_gate", false, last_entry_block_reason_);
+            return;
+        }
+
+        std::string market_reason;
+        if (!validate_market_quality(now_ns, market_reason)) {
+            last_entry_block_reason_ = market_reason;
+            long_confirm_ = 0;
+            publish_entry_decision(now_ns, "market_quality", false, market_reason, std::nullopt, false, market_reason);
+            return;
+        }
+        if (execution_.has_working_entry()) {
+            last_entry_block_reason_ = "working_order";
+            publish_entry_decision(now_ns, "working_order", false, last_entry_block_reason_, std::nullopt, true);
+            return;
+        }
+        if (execution_.external_exit_replacement_in_progress()) {
+            last_entry_block_reason_ = "external_exit_replacement_pending";
+            publish_entry_decision(now_ns, "external_exit_replacement", false, last_entry_block_reason_, std::nullopt, true);
+            return;
+        }
+        if (execution_.has_conflicting_opposite_order()) {
+            last_entry_block_reason_ = "conflicting_opposite_order";
+            publish_entry_decision(now_ns, "conflicting_order", false, last_entry_block_reason_, std::nullopt, true);
+            return;
+        }
+        if (execution_.inventory.qty > 0 && !can_scale_in_with_live_tp()) {
+            last_entry_block_reason_ = "scale_in_blocked";
+            publish_entry_decision(now_ns, "scale_in", false, last_entry_block_reason_, std::nullopt, true);
+            return;
+        }
+
+        const auto risk_gate = risk_.can_enter(now_ns);
+        if (!risk_gate.first) {
+            last_entry_block_reason_ = risk_gate.second;
+            publish_entry_decision(now_ns, "local_risk", false, last_entry_block_reason_, std::nullopt, true, "", false);
+            return;
+        }
+
+        const auto decision = evaluate_long_signal(*latest_board_, *latest_signal_, config_);
+        if (!decision.allow) {
+            last_entry_block_reason_ = decision.reason;
+            long_confirm_ = 0;
+            publish_entry_decision(now_ns, "policy", false, last_entry_block_reason_, decision, true);
+            return;
+        }
+
+        // Optional execution quality gate
+        if (config_.enable_exec_quality_gate) {
+            const double tick = execution_.get_tse_order_tick(latest_board_->mid());
+            const auto exec_quality = compute_execution_quality(*latest_board_, *latest_signal_, config_, tick);
+            if (exec_quality.total() < config_.min_exec_quality_score) {
+                last_entry_block_reason_ = "exec_quality:" + std::to_string(exec_quality.total());
+                if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) {
+                    ++near_miss_count_;
+                    last_near_miss_ts_ns_ = now_ns;
+                    last_near_miss_reason_ = last_entry_block_reason_;
+                }
+                publish_entry_decision(now_ns, "exec_quality", false, last_entry_block_reason_, decision, true);
+                return;
+            }
+        }
+
+        // Dynamic position sizing: scale up base volume on high-confidence signals
+        int base_volume = config_.trade_volume;
+        if (config_.scale_qty_by_score && decision.entry_score >= config_.scale_qty_score_threshold) {
+            base_volume = static_cast<int>(config_.trade_volume * config_.scale_qty_multiplier);
+            if (config_.scale_qty_max_volume > 0) {
+                base_volume = std::min(base_volume, config_.scale_qty_max_volume);
+            }
+        }
+        int order_qty = std::min(base_volume, std::max(config_.max_long_inventory - execution_.inventory.qty, 0));
         if (symbol_config_.max_notional > 0 && latest_board_->ask > 0) {
             order_qty = std::min(order_qty, static_cast<int>(symbol_config_.max_notional / latest_board_->ask));
         }
-        if (order_qty <= 0) { last_entry_block_reason_ = "symbol_inventory_limit"; return; }
+        if (order_qty <= 0) {
+            last_entry_block_reason_ = "symbol_inventory_limit";
+            if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+            publish_entry_decision(now_ns, "inventory_limit", false, last_entry_block_reason_, decision, true);
+            return;
+        }
         order_qty = align_order_qty_to_lot_size(order_qty);
-        if (order_qty <= 0) { last_entry_block_reason_ = "lot_size_rounddown"; return; }
-        if (entry_guard_) { const auto guard = entry_guard_(order_qty, latest_board_->ask); if (!guard.first) { last_entry_block_reason_ = guard.second; return; } }
-        if (now_ns - last_entry_order_action_ns_ < static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) { last_entry_block_reason_ = "entry_interval"; return; }
-        if (++long_confirm_ < decision.required_confirm) { last_entry_block_reason_ = "confirming"; return; }
+        if (order_qty <= 0) {
+            last_entry_block_reason_ = "lot_size_rounddown";
+            if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+            publish_entry_decision(now_ns, "lot_size", false, last_entry_block_reason_, decision, true);
+            return;
+        }
+
+        if (entry_guard_) {
+            const auto guard = entry_guard_(order_qty, latest_board_->ask);
+            if (!guard.first) {
+                last_entry_block_reason_ = guard.second;
+                if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+                publish_entry_decision(
+                    now_ns,
+                    "account_guard",
+                    false,
+                    last_entry_block_reason_,
+                    decision,
+                    true,
+                    "",
+                    true,
+                    false,
+                    guard.second
+                );
+                return;
+            }
+        }
+
+        if (now_ns - last_entry_order_action_ns_ <
+            static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) {
+            last_entry_block_reason_ = "entry_interval";
+            if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+            publish_entry_decision(now_ns, "entry_interval", false, last_entry_block_reason_, decision, true);
+            return;
+        }
+
+        const int next_confirm = long_confirm_ + 1;
+        if (++long_confirm_ < decision.required_confirm) {
+            last_entry_block_reason_ = "confirming";
+            publish_entry_decision(
+                now_ns,
+                "confirm",
+                false,
+                last_entry_block_reason_,
+                decision,
+                true,
+                "",
+                true,
+                true,
+                "",
+                next_confirm
+            );
+            return;
+        }
         long_confirm_ = 0;
         const double entry_price = decision.entry_mode == ENTRY_MODE_TAKER ? latest_board_->ask : latest_board_->bid;
         working_entry_mode_ = decision.entry_mode;
         working_entry_score_ = decision.entry_score;
         working_entry_scale_in_counted_ = false;
-        if (execution_.open_explicit(1, order_qty, entry_price, *latest_board_, "long_entry", decision.entry_mode == ENTRY_MODE_TAKER, decision.entry_mode, decision.entry_score)) {
+        if (execution_.open_explicit(
+                1,
+                order_qty,
+                entry_price,
+                *latest_board_,
+                "long_entry",
+                decision.entry_mode == ENTRY_MODE_TAKER,
+                decision.entry_mode,
+                decision.entry_score
+            )) {
             working_entry_is_scale_in_ = execution_.inventory.qty > 0;
             last_entry_order_action_ns_ = now_ns;
             last_entry_block_reason_ = "entered";
+            publish_entry_decision(now_ns, "entered", true, last_entry_block_reason_, decision, true);
             if (execution_.inventory.qty > 0) {
                 post_execution_update(now_ns);
                 handle_exit(now_ns);
                 submit_delayed_tp(now_ns);
             }
+            return;
         }
+        last_entry_block_reason_ =
+            now_ns < execution_.entry_blocked_until_ns ? "entry_api_backoff" : "entry_submit_rejected";
+        publish_entry_decision(now_ns, "execution_submit", false, last_entry_block_reason_, decision, true);
     }
 
     void handle_exit(std::int64_t now_ns) {
@@ -554,6 +902,7 @@ class MicroEdgeStrategy {
     bool dry_run_{true};
     std::shared_ptr<TradeJournal> journal_{nullptr};
     EntryGuard entry_guard_;
+    DecisionTraceSink decision_trace_sink_;
     execution::ExecutionController execution_;
     signals::MicroEdgeSignalEngine signal_engine_;
     risk::RiskController risk_;
@@ -579,6 +928,7 @@ class MicroEdgeStrategy {
     double observed_inventory_avg_price_{0.0};
     int observed_inventory_qty_before_close_{0};
     std::string last_entry_block_reason_{"startup"};
+    DecisionTrace last_entry_decision_{};
     bool need_submit_limit_tp_{false};
     double pending_tp_price_{0.0};
     int pending_tp_volume_{0};
@@ -590,6 +940,11 @@ class MicroEdgeStrategy {
     std::int64_t last_exit_order_action_ns_{0};
     std::int64_t last_limit_tp_order_action_ns_{0};
     int long_confirm_{0};
+    std::int64_t last_jump_detected_ns_{0};
+    double       pre_gap_mid_{0.0};
+    int          near_miss_count_{0};
+    std::int64_t last_near_miss_ts_ns_{0};
+    std::string  last_near_miss_reason_;
     bool kill_switch_active_{false};
     std::string kill_switch_reason_;
     bool kill_switch_hard_close_{false};

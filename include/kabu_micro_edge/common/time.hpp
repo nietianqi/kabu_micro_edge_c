@@ -99,6 +99,14 @@ inline std::tuple<int, int, int> jst_day_key(std::int64_t ts_ns) {
     return {year, static_cast<int>(month), static_cast<int>(day)};
 }
 
+inline int jst_seconds_of_day(std::int64_t ts_ns) {
+    constexpr std::int64_t jst_offset_ns = 9LL * 3600LL * 1'000'000'000LL;
+    const std::int64_t adjusted_ns = ts_ns + jst_offset_ns;
+    const std::int64_t total_seconds = adjusted_ns / 1'000'000'000LL;
+    const int seconds = static_cast<int>(total_seconds % 86400LL);
+    return seconds >= 0 ? seconds : seconds + 86400;
+}
+
 inline std::string format_compact_decimal(double value) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(6) << value;

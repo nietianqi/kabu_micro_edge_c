@@ -37,6 +37,14 @@ inline const nlohmann::json& default_config_json() {
         {"shutdown_emergency_timeout_s", 5.0},
         {"startup_retry_count", 3},
         {"startup_retry_delay_s", 2.0},
+        {"live_safety",
+         {{"enabled", true},
+          {"rest_error_cooldown_seconds", 5.0},
+          {"max_consecutive_rest_errors", 3},
+          {"hard_kill_on_max_consecutive_rest_errors", true}}},
+        {"diagnostics",
+         {{"jsonl_path", ""},
+          {"heartbeat_interval_s", 15}}},
         {"order_profile",
          {{"mode", "margin"},
           {"allow_short", false},
@@ -122,6 +130,9 @@ inline const nlohmann::json& default_config_json() {
           {"market_close", "15:30"},
           {"lunch_break_start", "11:30"},
           {"lunch_break_end", "12:30"},
+          {"enforce_session_gate", true},
+          {"allow_entries_during_lunch_break", false},
+          {"entry_cutoff_seconds_before_close", 0},
           {"commission_per_share", 0.0}}}
     };
     return value;
@@ -250,6 +261,15 @@ inline void validate_account_risk(const AccountRiskConfig& account_risk) {
     }
 }
 
+inline void validate_live_safety(const LiveSafetyConfig& live_safety) {
+    if (live_safety.rest_error_cooldown_seconds < 0) {
+        throw std::runtime_error("config.json live_safety.rest_error_cooldown_seconds must be >= 0.");
+    }
+    if (live_safety.max_consecutive_rest_errors < 0) {
+        throw std::runtime_error("config.json live_safety.max_consecutive_rest_errors must be >= 0.");
+    }
+}
+
 inline void validate_strategy_ranges(const StrategyConfig& strategy) {
     auto require = [](bool condition, const std::string& message) {
         if (!condition) {
@@ -302,6 +322,10 @@ inline void validate_strategy_ranges(const StrategyConfig& strategy) {
     require(strategy.limit_tp_delay_seconds >= 0, "config.json strategy.limit_tp_delay_seconds must be >= 0.");
     require(strategy.min_order_lifetime_ms >= 0, "config.json strategy.min_order_lifetime_ms must be >= 0.");
     require(strategy.max_requotes_per_minute > 0, "config.json strategy.max_requotes_per_minute must be > 0.");
+    require(
+        strategy.entry_cutoff_seconds_before_close >= 0,
+        "config.json strategy.entry_cutoff_seconds_before_close must be >= 0."
+    );
     require(strategy.commission_per_share >= 0, "config.json strategy.commission_per_share must be >= 0.");
 }
 
@@ -318,6 +342,11 @@ inline void validate_market_session(const StrategyConfig& strategy) {
     }
     if (lunch_start_minutes < market_open_minutes || lunch_end_minutes > market_close_minutes) {
         throw std::runtime_error("config.json strategy lunch break must stay within the trading session.");
+    }
+    if (strategy.entry_cutoff_seconds_before_close >= (market_close_minutes - market_open_minutes) * 60) {
+        throw std::runtime_error(
+            "config.json strategy.entry_cutoff_seconds_before_close must be shorter than the trading session."
+        );
     }
 }
 
@@ -435,6 +464,9 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
     strategy.market_close = strategy_cfg.value("market_close", std::string("15:30"));
     strategy.lunch_break_start = strategy_cfg.value("lunch_break_start", std::string("11:30"));
     strategy.lunch_break_end = strategy_cfg.value("lunch_break_end", std::string("12:30"));
+    strategy.enforce_session_gate = strategy_cfg.value("enforce_session_gate", true);
+    strategy.allow_entries_during_lunch_break = strategy_cfg.value("allow_entries_during_lunch_break", false);
+    strategy.entry_cutoff_seconds_before_close = strategy_cfg.value("entry_cutoff_seconds_before_close", 0);
     strategy.commission_per_share = strategy_cfg.value("commission_per_share", 0.0);
     validate_strategy_modes(strategy);
     validate_strategy_ranges(strategy);
@@ -494,6 +526,16 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
     if (alert_timeout_s <= 0) {
         throw std::runtime_error("config.json alert_timeout_s must be > 0.");
     }
+    const auto diagnostics_cfg =
+        payload.contains("diagnostics") && payload.at("diagnostics").is_object()
+            ? payload.at("diagnostics")
+            : nlohmann::json::object();
+    DiagnosticsConfig diagnostics;
+    diagnostics.jsonl_path = diagnostics_cfg.value("jsonl_path", std::string());
+    diagnostics.heartbeat_interval_s = diagnostics_cfg.value("heartbeat_interval_s", 15);
+    if (diagnostics.heartbeat_interval_s <= 0) {
+        throw std::runtime_error("config.json diagnostics.heartbeat_interval_s must be > 0.");
+    }
 
     const auto account_risk_cfg =
         payload.contains("account_risk") && payload.at("account_risk").is_object()
@@ -505,6 +547,18 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
     account_risk.max_total_long_inventory = account_risk_cfg.value("max_total_long_inventory", 0);
     account_risk.max_total_notional = account_risk_cfg.value("max_total_notional", 0.0);
     validate_account_risk(account_risk);
+
+    const auto live_safety_cfg =
+        payload.contains("live_safety") && payload.at("live_safety").is_object()
+            ? payload.at("live_safety")
+            : nlohmann::json::object();
+    LiveSafetyConfig live_safety;
+    live_safety.enabled = live_safety_cfg.value("enabled", true);
+    live_safety.rest_error_cooldown_seconds = live_safety_cfg.value("rest_error_cooldown_seconds", 5.0);
+    live_safety.max_consecutive_rest_errors = live_safety_cfg.value("max_consecutive_rest_errors", 3);
+    live_safety.hard_kill_on_max_consecutive_rest_errors =
+        live_safety_cfg.value("hard_kill_on_max_consecutive_rest_errors", true);
+    validate_live_safety(live_safety);
 
     AppConfig config;
     config.api_password = payload.value("api_password", std::string());
@@ -532,6 +586,8 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
     config.order_profile =
         OrderProfile::from_json(payload.contains("order_profile") ? payload.at("order_profile") : nlohmann::json::object());
     config.account_risk = account_risk;
+    config.live_safety = live_safety;
+    config.diagnostics = diagnostics;
     config.symbols = symbols;
     config.strategy = strategy;
     return config;

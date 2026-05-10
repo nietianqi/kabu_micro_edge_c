@@ -124,3 +124,34 @@ TEST(ConfigTest, RejectsNonPositiveLotSize) {
 
     EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
 }
+
+TEST(ConfigTest, RejectsInvalidDiagnosticsHeartbeatInterval) {
+    const auto dir = make_temp_dir("config_bad_diagnostics");
+    const auto path = write_config(
+        dir,
+        {
+            {"diagnostics",
+             {
+                 {"jsonl_path", (dir / "diagnostics.jsonl").string()},
+                 {"heartbeat_interval_s", 0},
+             }},
+        }
+    );
+
+    EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
+}
+
+TEST(ConfigTest, RejectsNegativeLiveSafetyCooldown) {
+    const auto dir = make_temp_dir("config_bad_live_safety");
+    const auto path = write_config(
+        dir,
+        {
+            {"live_safety",
+             {
+                 {"rest_error_cooldown_seconds", -1.0},
+             }},
+        }
+    );
+
+    EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
+}

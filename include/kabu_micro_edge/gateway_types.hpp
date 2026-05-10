@@ -113,6 +113,7 @@ struct BoardSnapshot {
     std::vector<Level> asks;
     bool duplicate{false};
     bool out_of_order{false};
+    std::int64_t event_gap_ns{0};
     std::string bid_sign;
     std::string ask_sign;
     std::int64_t bid_ts_ns{0};

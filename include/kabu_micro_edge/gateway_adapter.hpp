@@ -84,6 +84,9 @@ class KabuAdapter {
             prev.has_value() && !snapshot.out_of_order && snapshot.ts_ns > 0 && snapshot.ts_ns == prev->ts_ns &&
             std::abs(snapshot.bid - prev->bid) <= 1e-9 && std::abs(snapshot.ask - prev->ask) <= 1e-9 &&
             snapshot.bid_size == prev->bid_size && snapshot.ask_size == prev->ask_size && snapshot.volume == prev->volume;
+        snapshot.event_gap_ns =
+            (!snapshot.out_of_order && prev.has_value() && prev->ts_ns > 0 && snapshot.ts_ns > 0)
+            ? (snapshot.ts_ns - prev->ts_ns) : 0;
         return snapshot;
     }
 
