@@ -287,6 +287,28 @@ TEST(StrategyTest, EntryBelowLotSizeIsBlockedBeforeOrderSubmission) {
     EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "lot_size_rounddown");
 }
 
+TEST(StrategyTest, MaxLossEmergencySubmitsExitEvenInTpOnlyMode) {
+    auto strategy = make_strategy();
+    strategy.start();
+
+    const auto ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:01+09:00");
+    strategy.execution().inventory.side = 1;
+    strategy.execution().inventory.qty = 100;
+    strategy.execution().inventory.avg_price = 1734.0;
+    strategy.execution().inventory.opened_ts_ns = ts - 1'000'000;
+
+    strategy.process_board(make_board(1728.0, 1728.5, 1200, 100, ts));
+
+    ASSERT_TRUE(strategy.execution().exit_order.has_value());
+    EXPECT_EQ(strategy.execution().exit_order->reason, "max_loss_emergency");
+    EXPECT_LT(strategy.execution().exit_order->price, 1728.0);
+
+    strategy.process_board(make_board(1728.0, 1728.5, 1200, 100, ts + 1'000'000));
+
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_FALSE(strategy.execution().exit_order.has_value());
+}
+
 TEST(StrategyTest, RecoveryGateBlocksNewEntriesInLiveMode) {
     auto config = kabu::config::load_config();
     config.symbol().symbol = "7269";

@@ -712,6 +712,12 @@ class MicroEdgeStrategy {
         if (!execution_.can_manage_local_exit()) return;
         if (execution_.has_stranded_partial && allow_exit_order(now_ns)) { execution_.close(*latest_board_, -9.0, "stranded_partial_exit", true, latest_board_->bid); last_exit_order_action_ns_ = now_ns; return; }
         if (tp_retry_exit_required_ && allow_exit_order(now_ns)) { execution_.close(*latest_board_, -2.0, "tp_retry_exhausted_exit", true, latest_board_->bid); last_exit_order_action_ns_ = now_ns; return; }
+        if (max_loss_emergency_due(*latest_board_) && allow_exit_order(now_ns)) {
+            clear_pending_tp();
+            execution_.close(*latest_board_, -9.0, "max_loss_emergency", true, emergency_exit_price(*latest_board_));
+            last_exit_order_action_ns_ = now_ns;
+            return;
+        }
         if (!config_.tp_only_mode && position_timeout_due(now_ns)) {
             position_timeout_exit_required_ = true;
             clear_pending_tp();
@@ -870,6 +876,26 @@ class MicroEdgeStrategy {
     [[nodiscard]] bool position_timeout_due(std::int64_t now_ns) const {
         return config_.max_position_hold_seconds > 0 && execution_.inventory.opened_ts_ns > 0 &&
                now_ns - execution_.inventory.opened_ts_ns >= static_cast<std::int64_t>(config_.max_position_hold_seconds * 1e9);
+    }
+
+    [[nodiscard]] bool max_loss_emergency_due(const gateway::BoardSnapshot& snapshot) const {
+        if (config_.max_loss_per_trade >= 0 || execution_.inventory.qty <= 0 || execution_.inventory.avg_price <= 0) {
+            return false;
+        }
+        const double mark_price = execution_.inventory.side >= 0 ? snapshot.bid : snapshot.ask;
+        if (mark_price <= 0) {
+            return false;
+        }
+        const double gross_pnl =
+            execution_.inventory.side * (mark_price - execution_.inventory.avg_price) * execution_.inventory.qty;
+        const double round_trip_commission =
+            config_.commission_per_share * execution_.inventory.qty * 2.0;
+        return gross_pnl - round_trip_commission < config_.max_loss_per_trade;
+    }
+
+    [[nodiscard]] double emergency_exit_price(const gateway::BoardSnapshot& snapshot) const {
+        const double tick = execution_.get_tse_order_tick(snapshot.bid);
+        return std::max(snapshot.bid - config_.exit_slip_ticks * tick, tick);
     }
 
     [[nodiscard]] double build_tp_price() const {

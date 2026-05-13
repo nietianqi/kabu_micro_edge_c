@@ -155,3 +155,57 @@ TEST(ConfigTest, RejectsNegativeLiveSafetyCooldown) {
 
     EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
 }
+
+TEST(ConfigTest, LoadsAdvancedStrategyControls) {
+    const auto dir = make_temp_dir("config_advanced_strategy_controls");
+    const auto path = write_config(
+        dir,
+        {
+            {"strategy",
+             {
+                 {"enable_jump_filter", false},
+                 {"jump_gap_seconds", 0.75},
+                 {"jump_mid_ticks", 4.5},
+                 {"jump_cooldown_ms", 900},
+                 {"enable_exec_quality_gate", true},
+                 {"min_exec_quality_score", 7},
+                 {"track_near_misses", false},
+                 {"near_miss_min_score", 11},
+                 {"scale_qty_by_score", true},
+                 {"scale_qty_score_threshold", 12},
+                 {"scale_qty_multiplier", 1.8},
+                 {"scale_qty_max_volume", 300},
+             }},
+        }
+    );
+
+    const auto config = kabu::config::load_config(path);
+    EXPECT_FALSE(config.strategy.enable_jump_filter);
+    EXPECT_DOUBLE_EQ(config.strategy.jump_gap_seconds, 0.75);
+    EXPECT_DOUBLE_EQ(config.strategy.jump_mid_ticks, 4.5);
+    EXPECT_EQ(config.strategy.jump_cooldown_ms, 900);
+    EXPECT_TRUE(config.strategy.enable_exec_quality_gate);
+    EXPECT_EQ(config.strategy.min_exec_quality_score, 7);
+    EXPECT_FALSE(config.strategy.track_near_misses);
+    EXPECT_EQ(config.strategy.near_miss_min_score, 11);
+    EXPECT_TRUE(config.strategy.scale_qty_by_score);
+    EXPECT_EQ(config.strategy.scale_qty_score_threshold, 12);
+    EXPECT_DOUBLE_EQ(config.strategy.scale_qty_multiplier, 1.8);
+    EXPECT_EQ(config.strategy.scale_qty_max_volume, 300);
+}
+
+TEST(ConfigTest, RejectsInvalidAdvancedStrategyRanges) {
+    const auto dir = make_temp_dir("config_bad_advanced_strategy_ranges");
+    const auto path = write_config(
+        dir,
+        {
+            {"strategy",
+             {
+                 {"jump_mid_ticks", 0.0},
+                 {"scale_qty_multiplier", 0.9},
+             }},
+        }
+    );
+
+    EXPECT_THROW(kabu::config::load_config(path), std::runtime_error);
+}

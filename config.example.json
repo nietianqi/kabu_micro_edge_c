@@ -130,6 +130,18 @@
     "lunch_break_end": "12:30",
     "enforce_session_gate": true,
     "allow_entries_during_lunch_break": false,
-    "entry_cutoff_seconds_before_close": 0
+    "entry_cutoff_seconds_before_close": 0,
+    "enable_jump_filter": true,
+    "jump_gap_seconds": 0.5,
+    "jump_mid_ticks": 3.0,
+    "jump_cooldown_ms": 500,
+    "enable_exec_quality_gate": false,
+    "min_exec_quality_score": 5,
+    "track_near_misses": true,
+    "near_miss_min_score": 9,
+    "scale_qty_by_score": false,
+    "scale_qty_score_threshold": 10,
+    "scale_qty_multiplier": 1.5,
+    "scale_qty_max_volume": 0
   }
 }

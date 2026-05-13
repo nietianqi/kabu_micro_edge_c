@@ -133,7 +133,19 @@ inline const nlohmann::json& default_config_json() {
           {"enforce_session_gate", true},
           {"allow_entries_during_lunch_break", false},
           {"entry_cutoff_seconds_before_close", 0},
-          {"commission_per_share", 0.0}}}
+          {"commission_per_share", 0.0},
+          {"enable_jump_filter", true},
+          {"jump_gap_seconds", 0.5},
+          {"jump_mid_ticks", 3.0},
+          {"jump_cooldown_ms", 500},
+          {"enable_exec_quality_gate", false},
+          {"min_exec_quality_score", 5},
+          {"track_near_misses", true},
+          {"near_miss_min_score", 9},
+          {"scale_qty_by_score", false},
+          {"scale_qty_score_threshold", 10},
+          {"scale_qty_multiplier", 1.5},
+          {"scale_qty_max_volume", 0}}}
     };
     return value;
 }
@@ -326,6 +338,26 @@ inline void validate_strategy_ranges(const StrategyConfig& strategy) {
         strategy.entry_cutoff_seconds_before_close >= 0,
         "config.json strategy.entry_cutoff_seconds_before_close must be >= 0."
     );
+    require(strategy.jump_gap_seconds >= 0, "config.json strategy.jump_gap_seconds must be >= 0.");
+    require(strategy.jump_mid_ticks > 0, "config.json strategy.jump_mid_ticks must be > 0.");
+    require(strategy.jump_cooldown_ms >= 0, "config.json strategy.jump_cooldown_ms must be >= 0.");
+    require(
+        strategy.min_exec_quality_score >= 0 && strategy.min_exec_quality_score <= 10,
+        "config.json strategy.min_exec_quality_score must be within [0, 10]."
+    );
+    require(
+        strategy.near_miss_min_score >= 0 && strategy.near_miss_min_score <= 13,
+        "config.json strategy.near_miss_min_score must be within [0, 13]."
+    );
+    require(
+        strategy.scale_qty_score_threshold > 0 && strategy.scale_qty_score_threshold <= 13,
+        "config.json strategy.scale_qty_score_threshold must be within [1, 13]."
+    );
+    require(
+        strategy.scale_qty_multiplier >= 1.0,
+        "config.json strategy.scale_qty_multiplier must be >= 1.0."
+    );
+    require(strategy.scale_qty_max_volume >= 0, "config.json strategy.scale_qty_max_volume must be >= 0.");
     require(strategy.commission_per_share >= 0, "config.json strategy.commission_per_share must be >= 0.");
 }
 
@@ -468,6 +500,18 @@ inline AppConfig load_config(const std::filesystem::path& path = {}) {
     strategy.allow_entries_during_lunch_break = strategy_cfg.value("allow_entries_during_lunch_break", false);
     strategy.entry_cutoff_seconds_before_close = strategy_cfg.value("entry_cutoff_seconds_before_close", 0);
     strategy.commission_per_share = strategy_cfg.value("commission_per_share", 0.0);
+    strategy.enable_jump_filter = strategy_cfg.value("enable_jump_filter", true);
+    strategy.jump_gap_seconds = strategy_cfg.value("jump_gap_seconds", 0.5);
+    strategy.jump_mid_ticks = strategy_cfg.value("jump_mid_ticks", 3.0);
+    strategy.jump_cooldown_ms = strategy_cfg.value("jump_cooldown_ms", 500);
+    strategy.enable_exec_quality_gate = strategy_cfg.value("enable_exec_quality_gate", false);
+    strategy.min_exec_quality_score = strategy_cfg.value("min_exec_quality_score", 5);
+    strategy.track_near_misses = strategy_cfg.value("track_near_misses", true);
+    strategy.near_miss_min_score = strategy_cfg.value("near_miss_min_score", 9);
+    strategy.scale_qty_by_score = strategy_cfg.value("scale_qty_by_score", false);
+    strategy.scale_qty_score_threshold = strategy_cfg.value("scale_qty_score_threshold", 10);
+    strategy.scale_qty_multiplier = strategy_cfg.value("scale_qty_multiplier", 1.5);
+    strategy.scale_qty_max_volume = strategy_cfg.value("scale_qty_max_volume", 0);
     validate_strategy_modes(strategy);
     validate_strategy_ranges(strategy);
     validate_market_session(strategy);
