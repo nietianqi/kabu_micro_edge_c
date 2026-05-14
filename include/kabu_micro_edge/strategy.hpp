@@ -592,6 +592,8 @@ class MicroEdgeStrategy {
             const auto exec_quality = compute_execution_quality(*latest_board_, *latest_signal_, config_, tick);
             if (exec_quality.total() < config_.min_exec_quality_score) {
                 last_entry_block_reason_ = "exec_quality:" + std::to_string(exec_quality.total());
+                reset_confirm();
+                record_near_miss_if_needed(decision, now_ns);
                 publish_entry_decision(now_ns, "exec_quality", false, last_entry_block_reason_, decision, true);
                 return;
             }
@@ -629,8 +631,8 @@ class MicroEdgeStrategy {
 
         if (now_ns - last_entry_order_action_ns_ <
             static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) {
-            last_entry_block_reason_ = "entry_interval";
-            if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+            last_entry_block_reason_ = "entry_rate_limit";
+            record_near_miss_if_needed(decision, now_ns);
             publish_entry_decision(now_ns, "entry_interval", false, last_entry_block_reason_, decision, true);
             return;
         }
@@ -650,7 +652,7 @@ class MicroEdgeStrategy {
         if (order_qty <= 0) {
             last_entry_block_reason_ = "symbol_inventory_limit";
             reset_confirm();
-            if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+            record_near_miss_if_needed(decision, now_ns);
             publish_entry_decision(now_ns, "inventory_limit", false, last_entry_block_reason_, decision, true);
             return;
         }
@@ -658,7 +660,7 @@ class MicroEdgeStrategy {
         if (order_qty <= 0) {
             last_entry_block_reason_ = "lot_size_rounddown";
             reset_confirm();
-            if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+            record_near_miss_if_needed(decision, now_ns);
             publish_entry_decision(now_ns, "lot_size", false, last_entry_block_reason_, decision, true);
             return;
         }
@@ -668,7 +670,7 @@ class MicroEdgeStrategy {
             if (!guard.first) {
                 last_entry_block_reason_ = guard.second;
                 reset_confirm();
-                if (config_.track_near_misses && decision.entry_score >= config_.near_miss_min_score) { ++near_miss_count_; last_near_miss_ts_ns_ = now_ns; last_near_miss_reason_ = last_entry_block_reason_; }
+                record_near_miss_if_needed(decision, now_ns);
                 publish_entry_decision(
                     now_ns,
                     "account_guard",
@@ -922,6 +924,15 @@ class MicroEdgeStrategy {
     void reset_confirm() {
         long_confirm_ = 0;
         last_confirm_ts_ns_ = 0;
+    }
+
+    void record_near_miss_if_needed(const EntryDecision& decision, std::int64_t now_ns) {
+        if (!config_.track_near_misses || decision.entry_score < config_.near_miss_min_score) {
+            return;
+        }
+        ++near_miss_count_;
+        last_near_miss_ts_ns_ = now_ns;
+        last_near_miss_reason_ = last_entry_block_reason_;
     }
 
     [[nodiscard]] int align_order_qty_to_lot_size(int qty) const {

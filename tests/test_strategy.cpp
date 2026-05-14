@@ -212,6 +212,141 @@ TEST(StrategyTest, EntryRoundsDownToConfiguredLotSize) {
     EXPECT_EQ(strategy.execution().exit_order->qty, 100);
 }
 
+TEST(StrategyTest, SignalExpiryResetsConfirmCounter) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 2;
+    config.strategy.use_adaptive_confirm = false;
+    config.strategy.strong_signal_confirm = 2;
+    config.strategy.signal_expire_seconds = 1.0;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, first_ts + 200'000'000));
+
+    auto status = strategy.status();
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_EQ(status["signal"]["decision_trace"]["stage"].get<std::string>(), "confirm");
+    EXPECT_EQ(status["signal"]["decision_trace"]["confirm_progress"].get<int>(), 1);
+
+    const auto expired_ts = first_ts + 2'000'000'000LL;
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, expired_ts));
+
+    status = strategy.status();
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_EQ(status["signal"]["decision_trace"]["stage"].get<std::string>(), "confirm");
+    EXPECT_EQ(status["signal"]["decision_trace"]["confirm_progress"].get<int>(), 1);
+
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, expired_ts + 200'000'000));
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "entered");
+}
+
+TEST(StrategyTest, EntryIntervalKeepsConfirmedSignalUntilRateLimitClears) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 200;
+    config.strategy.max_scale_in_per_round_trip = 2;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 2;
+    config.strategy.use_adaptive_confirm = false;
+    config.strategy.strong_signal_confirm = 2;
+    config.strategy.profit_ticks = 4.0;
+    config.strategy.aggressive_taker_profit_ticks = 4.0;
+    config.strategy.entry_order_interval_ms = 1000;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto first_ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, first_ts));
+    strategy.process_trade(make_trade(first_ts + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, first_ts + 200'000'000));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, first_ts + 300'000'000));
+    ASSERT_EQ(strategy.execution().inventory.qty, 100);
+
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, first_ts + 500'000'000));
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_EQ(strategy.status()["signal"]["decision_trace"]["stage"].get<std::string>(), "confirm");
+
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, first_ts + 700'000'000));
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "entry_rate_limit");
+
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, first_ts + 1'500'000'000LL));
+    EXPECT_EQ(strategy.execution().inventory.qty, 200);
+    EXPECT_EQ(strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(), "entered");
+}
+
+TEST(StrategyTest, ExecQualityGateResetsConfirmAndRecordsNearMiss) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 2;
+    config.strategy.use_adaptive_confirm = false;
+    config.strategy.strong_signal_confirm = 2;
+    config.strategy.enable_exec_quality_gate = true;
+    config.strategy.min_exec_quality_score = 10;
+    config.strategy.track_near_misses = true;
+    config.strategy.near_miss_min_score = 1;
+    config.strategy.maker_score_threshold = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto ts = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.100000+09:00");
+    strategy.process_board(make_board(1734.0, 1735.5, 300, 600, ts));
+    strategy.process_trade(make_trade(ts + 50'000'000, 1735.5, 1));
+    strategy.process_board(make_board(1734.0, 1735.5, 1500, 100, ts + 200'000'000));
+
+    const auto status = strategy.status();
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_EQ(status["signal"]["decision_trace"]["stage"].get<std::string>(), "exec_quality");
+    EXPECT_EQ(status["signal"]["decision_trace"]["confirm_progress"].get<int>(), 0);
+    EXPECT_EQ(status["analytics"]["near_miss"]["count"].get<int>(), 1);
+    EXPECT_EQ(status["analytics"]["near_miss"]["last_reason"].get<std::string>(), "exec_quality:8");
+}
+
 TEST(StrategyTest, KillSwitchBlocksNewEntries) {
     auto strategy = make_strategy();
     strategy.start();
