@@ -270,6 +270,15 @@ inline void to_json(nlohmann::json& json, const BoardSnapshot& value) {
         {"vwap", value.vwap},
         {"bids", value.bids},
         {"asks", value.asks},
+        {"duplicate", value.duplicate},
+        {"out_of_order", value.out_of_order},
+        {"event_gap_ns", value.event_gap_ns},
+        {"bid_sign", value.bid_sign},
+        {"ask_sign", value.ask_sign},
+        {"bid_ts_ns", value.bid_ts_ns},
+        {"ask_ts_ns", value.ask_ts_ns},
+        {"current_ts_ns", value.current_ts_ns},
+        {"ts_source", value.ts_source},
     };
 }
 
@@ -287,6 +296,15 @@ inline void from_json(const nlohmann::json& json, BoardSnapshot& value) {
     value.vwap = json.value("vwap", value.last);
     value.bids = json.at("bids").get<std::vector<Level>>();
     value.asks = json.at("asks").get<std::vector<Level>>();
+    value.duplicate     = json.value("duplicate",     false);
+    value.out_of_order  = json.value("out_of_order",  false);
+    value.event_gap_ns  = json.value("event_gap_ns",  std::int64_t{0});
+    value.bid_sign      = json.value("bid_sign",      std::string{});
+    value.ask_sign      = json.value("ask_sign",      std::string{});
+    value.bid_ts_ns     = json.value("bid_ts_ns",     std::int64_t{0});
+    value.ask_ts_ns     = json.value("ask_ts_ns",     std::int64_t{0});
+    value.current_ts_ns = json.value("current_ts_ns", std::int64_t{0});
+    value.ts_source     = json.value("ts_source",     std::string{});
 }
 
 inline void to_json(nlohmann::json& json, const TradePrint& value) {

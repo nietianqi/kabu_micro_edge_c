@@ -1007,6 +1007,333 @@ TEST(StrategyTest, LiveAdoptedInventoryCancelsReplaceableExternalExitBeforeManag
     EXPECT_EQ(exit_sends, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Jump detection tests
+// ---------------------------------------------------------------------------
+
+TEST(StrategyTest, JumpDetectionBlocksEntryDuringCooldown) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.enable_jump_filter = true;
+    config.strategy.jump_gap_seconds = 0.5;
+    config.strategy.jump_mid_ticks = 3.0;
+    config.strategy.jump_cooldown_ms = 500;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    // Board 1: sets pre_gap_mid_ = 1734.25 (neutral board, no jump)
+    auto board1 = make_board(1734.0, 1734.5, 300, 600, t0);
+    board1.event_gap_ns = 0;
+    strategy.process_board(board1);
+
+    // Buy tape pressure
+    strategy.process_trade(make_trade(t0 + 50'000'000, 1734.5, 1));
+
+    // Board 2: 600ms later, large mid move (4 ticks) + large gap → jump detected
+    // Without jump filter this would normally trigger entry (strong bullish signal)
+    auto board2 = make_board(1736.0, 1736.5, 1500, 100, t0 + 600'000'000);
+    board2.event_gap_ns = 600'000'000;  // 600ms gap > 0.5s threshold
+    strategy.process_board(board2);     // mid moves 4 ticks > 3.0 threshold
+
+    // Jump cooldown must block entry
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_EQ(
+        strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(),
+        "jump_cooldown"
+    );
+}
+
+TEST(StrategyTest, JumpDetectionExpiresAfterCooldown) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.enable_jump_filter = true;
+    config.strategy.jump_gap_seconds = 0.5;
+    config.strategy.jump_mid_ticks = 3.0;
+    config.strategy.jump_cooldown_ms = 500;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    // Board 1 + trade: warm up signal engine
+    auto board1 = make_board(1734.0, 1734.5, 300, 600, t0);
+    board1.event_gap_ns = 0;
+    strategy.process_board(board1);
+    strategy.process_trade(make_trade(t0 + 50'000'000, 1734.5, 1));
+
+    // Board 2: jump detected at t0+600ms
+    auto board2 = make_board(1736.0, 1736.5, 1500, 100, t0 + 600'000'000);
+    board2.event_gap_ns = 600'000'000;
+    strategy.process_board(board2);
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);  // blocked by jump cooldown
+
+    // Board 3: t0+1200ms — cooldown (500ms) has fully elapsed since t0+600ms
+    // Same strong bullish board; no new jump (mid unchanged from board2)
+    auto board3 = make_board(1736.0, 1736.5, 1500, 100, t0 + 1'200'000'000);
+    board3.event_gap_ns = 600'000'000;  // gap > threshold, but mid_move = 0 → no new jump
+    strategy.process_board(board3);
+
+    // Cooldown expired → entry must fire
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_NE(
+        strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(),
+        "jump_cooldown"
+    );
+}
+
+TEST(StrategyTest, JumpDetectionIgnoresSmallMidMove) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.enable_jump_filter = true;
+    config.strategy.jump_gap_seconds = 0.5;
+    config.strategy.jump_mid_ticks = 3.0;   // require 3 ticks of move
+    config.strategy.jump_cooldown_ms = 500;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    // Board 1: mid = 1734.25
+    auto board1 = make_board(1734.0, 1734.5, 300, 600, t0);
+    board1.event_gap_ns = 0;
+    strategy.process_board(board1);
+    strategy.process_trade(make_trade(t0 + 50'000'000, 1734.5, 1));
+
+    // Board 2: 600ms gap (> threshold), but mid = 1734.75 → only 1 tick move (< 3.0)
+    // Jump should NOT be detected; strong signal should trigger entry normally
+    auto board2 = make_board(1734.5, 1735.0, 1500, 100, t0 + 600'000'000);
+    board2.event_gap_ns = 600'000'000;  // large gap but small mid move
+    strategy.process_board(board2);
+
+    // Entry must fire — jump filter should not have blocked it
+    EXPECT_EQ(strategy.execution().inventory.qty, 100);
+    EXPECT_NE(
+        strategy.status()["risk"]["last_entry_block_reason"].get<std::string>(),
+        "jump_cooldown"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Near-miss tracker tests
+// ---------------------------------------------------------------------------
+
+TEST(StrategyTest, NearMissTrackerIncrementsOnStrongSignalBlockedByInventory) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 0;  // no inventory allowed → always blocks
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.track_near_misses = true;
+    config.strategy.near_miss_min_score = 6;  // same as maker_score_threshold default
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    EXPECT_EQ(strategy.status()["analytics"]["near_miss"]["count"].get<int>(), 0);
+
+    // Send strong bullish signal pattern (proven to produce entry_score >= 6)
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, t0));
+    strategy.process_trade(make_trade(t0 + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, t0 + 200'000'000));
+
+    // Signal was strong (allow=true, score >= 6) but inventory_limit blocked it
+    EXPECT_EQ(strategy.execution().inventory.qty, 0);
+    EXPECT_GE(strategy.status()["analytics"]["near_miss"]["count"].get<int>(), 1);
+    EXPECT_EQ(
+        strategy.status()["analytics"]["near_miss"]["last_reason"].get<std::string>(),
+        "symbol_inventory_limit"
+    );
+}
+
+TEST(StrategyTest, NearMissTrackerSkipsConfirmingPhase) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 0;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 3;          // require 3 ticks to enter
+    config.strategy.use_adaptive_confirm = false;
+    config.strategy.strong_signal_confirm = 3;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.track_near_misses = true;
+    config.strategy.near_miss_min_score = 6;
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    // Warm up tape and OBI with a strong pattern
+    strategy.process_trade(make_trade(t0, 1734.5, 1));
+    // Send 2 strong boards — still in confirming phase (need 3)
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, t0 + 100'000'000));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, t0 + 200'000'000));
+
+    // Confirming phase must NOT be counted as near-miss
+    EXPECT_EQ(strategy.status()["analytics"]["near_miss"]["count"].get<int>(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic position sizing tests
+// ---------------------------------------------------------------------------
+
+TEST(StrategyTest, DynamicSizingScalesQtyOnHighScore) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 300;   // allow scaled-up qty
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.scale_qty_by_score = true;
+    config.strategy.scale_qty_score_threshold = 6;  // matches maker_score_threshold
+    config.strategy.scale_qty_multiplier = 2.0;      // double the volume
+    config.strategy.scale_qty_max_volume = 0;         // no cap
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    // Strong bullish signal (score >= 6)
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, t0));
+    strategy.process_trade(make_trade(t0 + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, t0 + 200'000'000));
+
+    // Order qty should be scaled: 100 * 2.0 = 200 (within max_long_inventory=300)
+    EXPECT_EQ(strategy.execution().inventory.qty, 200);
+}
+
+TEST(StrategyTest, DynamicSizingRespectsMaxVolumeCap) {
+    auto config = kabu::config::load_config();
+    config.symbol().symbol = "7269";
+    config.symbol().exchange = 9;
+    config.symbol().tick_size = 0.5;
+    config.symbol().max_notional = 1'000'000;
+    config.strategy.trade_volume = 100;
+    config.strategy.max_long_inventory = 500;
+    config.strategy.book_imbalance_long = 0.35;
+    config.strategy.of_imbalance_long = 0.05;
+    config.strategy.tape_imbalance_long = 0.20;
+    config.strategy.mom_long_threshold = 0.15;
+    config.strategy.microprice_tilt_long = 0.20;
+    config.strategy.confirm_ticks = 1;
+    config.strategy.strong_signal_confirm = 1;
+    config.strategy.entry_order_interval_ms = 0;
+    config.strategy.exit_order_interval_ms = 0;
+    config.strategy.limit_tp_order_interval_ms = 0;
+    config.strategy.limit_tp_delay_seconds = 0.0;
+    config.strategy.aggressive_taker_mode = false;
+    config.strategy.scale_qty_by_score = true;
+    config.strategy.scale_qty_score_threshold = 6;
+    config.strategy.scale_qty_multiplier = 4.0;   // 100 * 4 = 400, but capped
+    config.strategy.scale_qty_max_volume = 200;    // hard cap at 200 (divisible by lot_size=100)
+
+    kabu::strategy::MicroEdgeStrategy strategy(config.symbol(), config.strategy, config.order_profile, true);
+    strategy.start();
+
+    const auto t0 = kabu::common::parse_iso8601_to_ns("2026-04-07T09:00:00.000000+09:00");
+
+    strategy.process_board(make_board(1734.0, 1734.5, 300, 600, t0));
+    strategy.process_trade(make_trade(t0 + 50'000'000, 1734.5, 1));
+    strategy.process_board(make_board(1734.5, 1735.0, 1500, 100, t0 + 200'000'000));
+
+    // Scaled qty = min(100*4, 200) = 200; lot_size=100, so 200 is already aligned
+    EXPECT_EQ(strategy.execution().inventory.qty, 200);
+}
+
 TEST(StrategyTest, LiveReconcileClearsRecoveredExternalOrdersAfterBrokerFinalizesThem) {
     auto strategy = make_live_strategy();
     strategy.start();

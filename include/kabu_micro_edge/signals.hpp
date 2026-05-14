@@ -291,7 +291,14 @@ class MicroEdgeSignalEngine {
           z_lob_(zscore_window),
           z_tape_(zscore_window),
           z_mom_(zscore_window),
-          z_tilt_(zscore_window) {}
+          z_tilt_(zscore_window) {
+        // Precompute book-depth decay weights: weight[i] = book_decay^i
+        // Avoids calling std::pow() on every board event.
+        decay_weights_.resize(book_depth_levels_);
+        for (int i = 0; i < book_depth_levels_; ++i) {
+            decay_weights_[i] = std::pow(book_decay_, static_cast<double>(i));
+        }
+    }
 
     [[nodiscard]] kabu::gateway::BoardSnapshot sanitize_snapshot(const kabu::gateway::BoardSnapshot& snapshot) const {
         return normalize_board_snapshot(snapshot, kabu_bidask_reversed_, auto_fix_negative_spread_);
@@ -364,7 +371,7 @@ class MicroEdgeSignalEngine {
         double bid_weight = 0.0;
         double ask_weight = 0.0;
         for (int level = 0; level < book_depth_levels_; ++level) {
-            const double weight = std::pow(book_decay_, static_cast<double>(level));
+            const double weight = decay_weights_[level];  // precomputed: no std::pow per tick
             if (level < static_cast<int>(snapshot.bids.size())) {
                 bid_weight += weight * snapshot.bids[level].size;
             }
@@ -458,6 +465,7 @@ class MicroEdgeSignalEngine {
     double tick_size_{1e-9};
     int book_depth_levels_{1};
     double book_decay_{0.75};
+    std::vector<double> decay_weights_;  // precomputed: decay_weights_[i] = book_decay_^i
     int min_best_volume_{1};
     bool kabu_bidask_reversed_{false};
     bool auto_fix_negative_spread_{true};

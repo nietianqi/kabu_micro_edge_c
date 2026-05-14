@@ -18,6 +18,7 @@
 #include "kabu_micro_edge/risk.hpp"
 #include "kabu_micro_edge/signals.hpp"
 #include "kabu_micro_edge/strategy_policy.hpp"
+#include "kabu_micro_edge/time_constants.hpp"
 
 namespace kabu::strategy {
 
@@ -180,7 +181,7 @@ class MicroEdgeStrategy {
         latest_board_ = signal_engine_.sanitize_snapshot(snapshot);
         // Jump detection: large time gap + large mid move → block entries briefly
         if (config_.enable_jump_filter && latest_board_.has_value() && latest_board_->event_gap_ns > 0) {
-            const double gap_s = static_cast<double>(latest_board_->event_gap_ns) / 1e9;
+            const double gap_s = static_cast<double>(latest_board_->event_gap_ns) / static_cast<double>(NS_PER_SEC);
             if (gap_s > config_.jump_gap_seconds && pre_gap_mid_ > 0.0) {
                 const double tick = execution_.get_tse_order_tick(latest_board_->mid());
                 const double mid_move = std::abs(latest_board_->mid() - pre_gap_mid_) / std::max(tick, 1e-9);
@@ -512,11 +513,11 @@ class MicroEdgeStrategy {
         if (board.bid <= 0 || board.ask <= 0 || board.bid >= board.ask) { reason = "bidask"; return false; }
         if (board.bid_size < config_.min_best_volume || board.ask_size < config_.min_best_volume) { reason = "best_volume"; return false; }
         if (signal.mid_std_ticks >= config_.max_mid_std_ticks) { reason = "mid_std"; return false; }
-        if (board.ts_ns > 0 && now_ns - board.ts_ns > static_cast<std::int64_t>(config_.max_tick_stale_seconds * 1e9)) { reason = "stale"; return false; }
+        if (board.ts_ns > 0 && now_ns - board.ts_ns > static_cast<std::int64_t>(config_.max_tick_stale_seconds) * NS_PER_SEC) { reason = "stale"; return false; }
         const double spread_ticks = board.spread() / std::max(execution_.get_tse_order_tick(board.mid()), 1e-9);
         if (spread_ticks < config_.min_spread_ticks || spread_ticks > config_.max_spread_ticks) { reason = "spread"; return false; }
         if (config_.enable_jump_filter && last_jump_detected_ns_ > 0) {
-            const auto cooldown_ns = static_cast<std::int64_t>(config_.jump_cooldown_ms) * 1'000'000LL;
+            const auto cooldown_ns = static_cast<std::int64_t>(config_.jump_cooldown_ms) * NS_PER_MS;
             if (now_ns - last_jump_detected_ns_ < cooldown_ns) { reason = "jump_cooldown"; return false; }
         }
         reason.clear(); return true;
@@ -601,7 +602,7 @@ class MicroEdgeStrategy {
 
         // Signal expiry: reset confirm counter if signal has been quiet too long
         if (last_confirm_ts_ns_ > 0 && config_.signal_expire_seconds > 0) {
-            const auto expire_ns = static_cast<std::int64_t>(config_.signal_expire_seconds * 1e9);
+            const auto expire_ns = static_cast<std::int64_t>(config_.signal_expire_seconds) * NS_PER_SEC;
             if (now_ns - last_confirm_ts_ns_ > expire_ns) {
                 reset_confirm();
             }
@@ -630,7 +631,7 @@ class MicroEdgeStrategy {
         }
 
         if (now_ns - last_entry_order_action_ns_ <
-            static_cast<std::int64_t>(config_.entry_order_interval_ms) * 1'000'000LL) {
+            static_cast<std::int64_t>(config_.entry_order_interval_ms) * NS_PER_MS) {
             last_entry_block_reason_ = "entry_rate_limit";
             record_near_miss_if_needed(decision, now_ns);
             publish_entry_decision(now_ns, "entry_interval", false, last_entry_block_reason_, decision, true);
@@ -761,7 +762,7 @@ class MicroEdgeStrategy {
         pending_tp_price_ = build_tp_price();
         pending_tp_volume_ = execution_.inventory.qty;
         need_submit_limit_tp_ = pending_tp_price_ > 0 && pending_tp_volume_ > 0;
-        if (need_submit_limit_tp_ && pending_tp_submit_after_ns_ <= 0) pending_tp_submit_after_ns_ = now_ns + static_cast<std::int64_t>(config_.limit_tp_delay_seconds * 1e9);
+        if (need_submit_limit_tp_ && pending_tp_submit_after_ns_ <= 0) pending_tp_submit_after_ns_ = now_ns + static_cast<std::int64_t>(config_.limit_tp_delay_seconds) * NS_PER_SEC;
     }
 
     void submit_delayed_tp(std::int64_t now_ns) {
@@ -777,7 +778,7 @@ class MicroEdgeStrategy {
         }
         if (!execution_.exit_order.has_value()) {
             ++pending_tp_retry_count_;
-            pending_tp_submit_after_ns_ = now_ns + static_cast<std::int64_t>(config_.limit_tp_delay_seconds * 1e9);
+            pending_tp_submit_after_ns_ = now_ns + static_cast<std::int64_t>(config_.limit_tp_delay_seconds) * NS_PER_SEC;
             if (pending_tp_retry_count_ >= config_.max_limit_tp_retries) {
                 tp_retry_exit_required_ = true;
                 pending_tp_retry_count_ = 0;
@@ -880,16 +881,16 @@ class MicroEdgeStrategy {
     }
 
     [[nodiscard]] bool allow_exit_order(std::int64_t now_ns) const {
-        return now_ns - last_exit_order_action_ns_ >= static_cast<std::int64_t>(config_.exit_order_interval_ms) * 1'000'000LL;
+        return now_ns - last_exit_order_action_ns_ >= static_cast<std::int64_t>(config_.exit_order_interval_ms) * NS_PER_MS;
     }
 
     [[nodiscard]] bool allow_limit_tp_order(std::int64_t now_ns) const {
-        return now_ns - last_limit_tp_order_action_ns_ >= static_cast<std::int64_t>(config_.limit_tp_order_interval_ms) * 1'000'000LL;
+        return now_ns - last_limit_tp_order_action_ns_ >= static_cast<std::int64_t>(config_.limit_tp_order_interval_ms) * NS_PER_MS;
     }
 
     [[nodiscard]] bool position_timeout_due(std::int64_t now_ns) const {
         return config_.max_position_hold_seconds > 0 && execution_.inventory.opened_ts_ns > 0 &&
-               now_ns - execution_.inventory.opened_ts_ns >= static_cast<std::int64_t>(config_.max_position_hold_seconds * 1e9);
+               now_ns - execution_.inventory.opened_ts_ns >= static_cast<std::int64_t>(config_.max_position_hold_seconds) * NS_PER_SEC;
     }
 
     [[nodiscard]] bool max_loss_emergency_due(const gateway::BoardSnapshot& snapshot) const {
